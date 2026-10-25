@@ -14,6 +14,7 @@ struct Settings {
     int sound_model = 0;      // 0 Amiga 500, 1 Amiga 1200, 2 unfiltered
     int stereo = 1;           // 0 Amiga (hard), 1 wide, 2 narrow, 3 mono
     bool up_jumps = false;    // the pad's up jumps too, as the Amiga joystick's did
+    bool ring_out = true;     // sounds the game cuts off fade out instead
 };
 
 bool operator==(const Settings &a, const Settings &b);

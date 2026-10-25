@@ -152,6 +152,7 @@ struct AudioOutput {
     enum Model { a500, a1200, clean } model = a500;   // whose analogue filters
     float separation = 0.7f;                          // 1: hard left/right, 0: mono
     float volume = 1.0f;
+    bool ring_out = true;                              // let abruptly cut sounds fade (not the Amiga's own)
 };
 void set_audio_output(const AudioOutput &o);
 // The menu's sound preview: the last few seconds of the game, frozen, then

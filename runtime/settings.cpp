@@ -26,6 +26,7 @@ const Field kFields[] = {
     {"sound_model", &Settings::sound_model, nullptr, 0, 2},
     {"stereo", &Settings::stereo, nullptr, 0, 3},
     {"up_jumps", nullptr, &Settings::up_jumps, 0, 1},
+    {"ring_out", nullptr, &Settings::ring_out, 0, 1},
 };
 
 } // namespace

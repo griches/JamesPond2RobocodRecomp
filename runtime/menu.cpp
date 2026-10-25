@@ -202,6 +202,12 @@ const std::vector<Page> &pages()
         "headphones.",
         {"Amiga", "Wide", "Narrow", "Mono"}, [](const View &v) { return S(v).stereo; },
         [](const View &v, int x) { S(v).stereo = x; return Request{}; }));
+    sound.rows.push_back(toggle(
+        "Let cut-off sounds ring out",
+        "Many of the game's sounds were cut off while still ringing. This lets them fade away over a moment "
+        "instead. The Amiga didn't do this; turn it off for the original.",
+        [](const View &v) { return int(S(v).ring_out); },
+        [](const View &v, int x) { S(v).ring_out = x != 0; return Request{}; }));
     p.push_back(sound);
 
     Page cheats{"Cheats", icon::cheats, "The game's own cheats, without typing the secret word.", {}};
@@ -566,15 +572,16 @@ void draw_slot_detail(const View &v, const Row &r)
 
 void draw_sound_card(const View &v, float y)
 {
-    float x = kRowX, w = row_w(), h = 220;
+    float x = kRowX, w = row_w(), h = 150;
     ui::rect_v(x, y, w, h, kRadius, F(ui::alpha(kInk, 0.045f)), F(ui::alpha(kInk, 0.02f)));
-    ui::icon(icon::music, 30, x + 46, y + 48, F(kAccent));
-    small_caps(x + 76, y + 48, "LISTENING", kFaint);
-    ui::text(ui::regular, 21, x + 32, y + 94, "The last few seconds of the game, through these settings.", F(kDim));
+    ui::icon(icon::music, 26, x + 44, y + 38, F(kAccent));
+    float lx = x + 70 + ui::text_width(ui::semibold, 15, "LISTENING", 2.2f) + 16;
+    small_caps(x + 70, y + 38, "LISTENING", kFaint);
+    ui::text(ui::regular, 20, lx, y + 38, "the last few seconds of the game, through these settings", F(kDim));
     // Left and right, as two meters of lit bars.
     for (int side = 0; side < 2; side++) {
         float level = std::clamp(side ? v.level_r : v.level_l, 0.0f, 1.0f);
-        float my = y + 140 + float(side) * 40;
+        float my = y + 82 + float(side) * 36;
         ui::text(ui::semibold, 17, x + 32, my, side ? "R" : "L", F(kFaint));
         int bars = 40;
         float bx = x + 64, bw = (w - 64 - 32) / float(bars);
@@ -902,7 +909,7 @@ void draw(const View &v, float dt)
     if (page_no == kGame)
         draw_stats(v, kRowsY + 3 * kRowPitch + 24);
     if (page_no == kSound)
-        draw_sound_card(v, kRowsY + 3 * kRowPitch + 24);
+        draw_sound_card(v, kRowsY + float(page.rows.size()) * kRowPitch + 14);
     if (page_no == kSave || page_no == kLoad)
         draw_slot_detail(v, page.rows[size_t(in_rows ? row_no : 0)]);
     if (page_no == kControls) {

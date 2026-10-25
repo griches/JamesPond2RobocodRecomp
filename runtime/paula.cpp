@@ -8,10 +8,13 @@
 // 34 kHz; the "LED" filter when CIA-A switches it on; and the coupling
 // capacitor's high-pass), then a low-pass FIR brings them down to 48 kHz.
 #include "amiga.h"
+#include "cpu.h"
 #include "state.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -155,11 +158,107 @@ static int loop_pos;
 
 static uint16_t &dmacon_reg() { return regs[0x002 >> 1]; }
 
+static bool audio_log_on();
+
+// Ringing out: many of the game's samples were cut off while still sounding,
+// and on the Amiga they simply stop. With AudioOutput::ring_out the last wave
+// cycle a channel played carries on, fading over a moment, until the channel
+// plays something again.
+struct Ring {
+    bool on;
+    int8_t wave[64];
+    int len, idx;
+    double ticks, per;   // Paula clocks left on this sample, and per sample
+    double env, decay;
+    int vol;
+};
+static Ring ringing[4];
+static int8_t recent[4][128];   // the last samples each channel played, oldest first from recent_pos
+static int recent_pos[4];
+
+static void ring_out(int n)
+{
+    Ring &r = ringing[n];
+    const Channel &c = ch[n];
+    if (!output.ring_out || r.on || c.vol == 0)
+        return;
+    int8_t last[128];
+    for (int i = 0; i < 128; i++)
+        last[i] = recent[n][(recent_pos[n] + i) & 127];
+    // Only a sound that was still going: something left in its last samples.
+    double power = 0;
+    for (int i = 112; i < 128; i++)
+        power += double(last[i]) * last[i];
+    if (power / 16 < 8.0 * 8.0)
+        return;
+    // Its cycle: how well the last samples match themselves shifted by each
+    // lag. Neighbours always look alike, so look for the best match after the
+    // match has first fallen away; nothing repeating (noise, a drum) rings no tone.
+    double match[65] = {};
+    for (int lag = 1; lag <= 64; lag++) {
+        double xy = 0, xx = 0, yy = 0;
+        for (int i = 128 - 64; i < 128; i++) {
+            double a = last[i], b = last[i - lag];
+            xy += a * b;
+            xx += a * a;
+            yy += b * b;
+        }
+        match[lag] = xy / (std::sqrt(xx * yy) + 1e-9);
+    }
+    int from = 0;
+    for (int lag = 1; lag <= 64 && !from; lag++)
+        if (match[lag] < 0.2)
+            from = lag;
+    int best = 0;
+    for (int lag = from ? from : 65; lag <= 64; lag++)
+        if (match[lag] > 0.6 && (!best || match[lag] > match[best]))
+            best = lag;
+    if (!best)
+        return;
+    r.len = best;
+    for (int i = 0; i < best; i++)
+        r.wave[i] = last[128 - best + i];
+    r.idx = 0;
+    r.per = c.per < 124 ? 124 : c.per;
+    r.ticks = r.per;
+    r.env = 1;
+    r.decay = std::exp(-r.per / (0.022 * kPaulaClockPal));   // falls to 1/e in 22 ms
+    r.vol = c.vol;
+    r.on = true;
+    if (audio_log_on())
+        std::printf("ring ch%d lc %06X cycle %d vol %d\n", n, c.lc, best, c.vol);
+}
+
+// True when a block holds nothing but silence (the game's way of ending a sound).
+static bool silent_block(uint32_t lc, uint16_t len)
+{
+    if (len == 0 || len > 64)
+        return false;
+    for (uint32_t i = 0; i < len; i++)
+        if (chip16((lc & ~1u) + i * 2))
+            return false;
+    return true;
+}
+
+// JP2_AUDIOLOG=1: each channel's starts, loops, stops and volume changes, by time.
+static const bool audio_log = std::getenv("JP2_AUDIOLOG") != nullptr;
+static long lines_run;
+static bool audio_log_on() { return audio_log; }
+static double log_ms() { return double(lines_run) * 1000.0 / (50.0 * kLinesPal); }
+
 static void start_block(int n)
 {
     Channel &c = ch[n];
     c.pt = c.lc & ~1u;
     c.words_left = c.len ? c.len : 0x10000;
+    if (!starting) {   // the next block: silence lets the last sound ring out, a sound stops it
+        if (silent_block(c.lc, c.len))
+            ring_out(n);
+        else
+            ringing[n].on = false;
+    }
+    if (audio_log && !starting)
+        std::printf("%9.2f ch%d loop  lc %06X len %5u\n", log_ms(), n, c.lc, c.len);
     if (starting) {
         start_irq_lines[n] = 2;   // after the rest of this line and the next
     } else {
@@ -183,7 +282,11 @@ void paula_dma_changed(uint16_t old_dmacon, uint16_t new_dmacon)
         bool was = (old_dmacon & DMA_EN) && (old_dmacon & (1 << n));
         bool now = (new_dmacon & DMA_EN) && (new_dmacon & (1 << n));
         Channel &c = ch[n];
+        if (audio_log && now != was)
+            std::printf("%9.2f ch%d %s lc %06X len %5u per %4u vol %2u  words left %5u  pc %06X\n", log_ms(), n,
+                        now ? "START" : "stop ", c.lc, c.len, c.per, c.vol, now ? 0 : c.words_left, cpu_reg(PC));
         if (now && !was) {
+            ringing[n].on = false;
             c.running = true;
             starting = true;
             start_block(n);
@@ -193,6 +296,7 @@ void paula_dma_changed(uint16_t old_dmacon, uint16_t new_dmacon)
             c.ticks = c.per ? c.per : 1;
             c.sample = int8_t(c.word >> 8);
         } else if (!now && was) {
+            ring_out(n);
             c.running = false;
             c.sample = 0;
             start_irq_lines[n] = 0;   // stopped before the first fetch: no interrupt
@@ -209,7 +313,11 @@ void paula_reg_write(uint32_t off, uint16_t v)
     case 0x2: c.lc = (c.lc & 0xFFFF0000u) | v; break;
     case 0x4: c.len = v; break;
     case 0x6: c.per = v; break;
-    case 0x8: c.vol = v & 0x40 ? 64 : (v & 0x3F); break;
+    case 0x8:
+        if (audio_log && c.running && (v & 0x7F) != c.vol)
+            std::printf("%9.2f ch%d vol %2u -> %2u\n", log_ms(), n, c.vol, v & 0x40 ? 64 : (v & 0x3F));
+        c.vol = v & 0x40 ? 64 : (v & 0x3F);
+        break;
     case 0xA:
         if (!c.running) {   // CPU-driven output: play the pair once
             c.word = v;
@@ -236,26 +344,48 @@ static void step(double clocks)
 {
     for (int n = 0; n < 4; n++) {
         Channel &c = ch[n];
+        Ring &r = ringing[n];
         double left = clocks;
-        if (!c.running) {
+        if (!c.running && !r.on) {
             acc[n] += c.sample * c.vol * left;
             continue;
         }
         double per = c.per < 124 ? 124 : c.per;
         while (left > 0) {
-            double run = c.ticks < left ? c.ticks : left;
-            acc[n] += c.sample * c.vol * run;
-            c.ticks -= run;
+            double run = left;
+            if (c.running && c.ticks < run)
+                run = c.ticks;
+            if (r.on && r.ticks < run)
+                run = r.ticks;
+            double out = c.sample * c.vol;
+            if (r.on)
+                out += r.wave[r.idx] * r.env * r.vol;
+            acc[n] += out * run;
             left -= run;
-            if (c.ticks <= 0) {
-                c.ticks += per;
-                if (c.byte == 0) {
-                    c.byte = 1;
-                    c.sample = int8_t(c.word);
-                } else {
-                    c.byte = 0;
-                    next_word(n);
-                    c.sample = int8_t(c.word >> 8);
+            if (c.running) {
+                c.ticks -= run;
+                if (c.ticks <= 0) {
+                    c.ticks += per;
+                    if (c.byte == 0) {
+                        c.byte = 1;
+                        c.sample = int8_t(c.word);
+                    } else {
+                        c.byte = 0;
+                        next_word(n);
+                        c.sample = int8_t(c.word >> 8);
+                    }
+                    recent[n][recent_pos[n]] = c.sample;
+                    recent_pos[n] = (recent_pos[n] + 1) & 127;
+                }
+            }
+            if (r.on) {
+                r.ticks -= run;
+                if (r.ticks <= 0) {
+                    r.ticks += r.per;
+                    r.idx = (r.idx + 1) % r.len;
+                    r.env *= r.decay;
+                    if (r.env < 0.004)
+                        r.on = false;
                 }
             }
         }
@@ -269,6 +399,7 @@ void paula_run_line()
     double clock = kPaulaClockPal;   // close enough for NTSC too
     double per_line = clock / (pal_mode() ? 50.0 * kLinesPal : 60.0 * kLinesNtsc);
     double per_step = clock / kStepRate;
+    lines_run++;
     for (int n = 0; n < 4; n++)
         if (start_irq_lines[n] && --start_irq_lines[n] == 0)
             request_irq(uint16_t(INT_AUD0 << n));
@@ -366,6 +497,7 @@ void paula_state(StateIO &s)
     s.bytes(acc, sizeof acc);
     if (s.loading()) {
         std::memset(start_irq_lines, 0, sizeof start_irq_lines);
+        std::memset(ringing, 0, sizeof ringing);
         std::lock_guard<std::mutex> g(ring_lock);
         ring_r = ring_w;
     }

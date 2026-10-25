@@ -543,6 +543,7 @@ void apply_audio(const settings::Settings &s)
     o.model = AudioOutput::Model(s.sound_model);
     o.separation = width[s.stereo];
     o.volume = 1.5f * std::pow(float(s.volume) / 10.0f, 1.7f);
+    o.ring_out = s.ring_out;
     set_audio_output(o);
 }
 
@@ -1122,7 +1123,7 @@ int run_window(bool force_fullscreen, const std::string &load_from)
             if (set.widescreen != applied.widescreen)
                 wide::set_view_extra(set.widescreen ? (wide_w - 288) / 2 : 0);
             if (set.sound_model != applied.sound_model || set.stereo != applied.stereo ||
-                set.volume != applied.volume)
+                set.volume != applied.volume || set.ring_out != applied.ring_out)
                 apply_audio(set);
             applied = set;
         }
@@ -1349,13 +1350,14 @@ int main(int argc, char **argv)
         } else if (!std::strcmp(argv[i], "--wav") && i + 1 < argc) {
             wav_path = argv[++i];
         } else if (!std::strcmp(argv[i], "--audio") && i + 1 < argc) {
-            // --audio a500|a1200|clean[,separation]: for comparing the output stages
+            // --audio a500|a1200|clean[,separation][,noring]: for comparing the output stages
             AudioOutput o;
             std::string v = argv[++i];
             o.model = v.rfind("a1200", 0) == 0 ? AudioOutput::a1200 : v.rfind("clean", 0) == 0 ? AudioOutput::clean
                                                                                                 : AudioOutput::a500;
             if (size_t c = v.find(','); c != std::string::npos)
                 o.separation = float(std::atof(v.c_str() + c + 1));
+            o.ring_out = v.find("noring") == std::string::npos;
             set_audio_output(o);
         } else if (!std::strcmp(argv[i], "--load") && i + 1 < argc) {
             load_from = argv[++i];
