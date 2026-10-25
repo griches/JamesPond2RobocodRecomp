@@ -198,6 +198,18 @@ bool geometry(Geometry *g)
     int first = 2 * (ps.ddfstrt & 0xFC) + 17;          // display column of the first fetched pixel
     int delay = ps.bplcon1 & 15;                       // plane 5 is odd: playfield 1 scroll
     const Params *pp = blit_for_shown();
+    if (pp) {
+        uint32_t off = pp->par_a - kParallax;
+        int lead = int(int32_t(ps.bpl[4] - pp->par_d)) * 8;
+        g->par_x0 = int(off % 64) * 8 + lead - pp->par_shift + (g->h0 - first) - delay;
+        g->par_y0 = int(off / 64);
+        g->par_known = true;
+        // A blit position carried over (from before a save, or another room)
+        // can be stale: trust it only while it matches what is on screen.
+        if (layer_matches(g->h0, g->v0, g->w, g->par_x0, g->par_y0))
+            return true;
+        pp = nullptr;
+    }
     if (!pp) {
         Found &f = found_for(ps.bpl[4]);
         if (f.valid && !layer_matches(g->h0, g->v0, g->w, f.base_x - delay, f.y0))
@@ -213,11 +225,6 @@ bool geometry(Geometry *g)
         g->par_known = f.valid;
         return true;
     }
-    g->par_known = true;
-    uint32_t off = pp->par_a - kParallax;
-    int lead = int(int32_t(ps.bpl[4] - pp->par_d)) * 8;
-    g->par_x0 = int(off % 64) * 8 + lead - pp->par_shift + (g->h0 - first) - delay;
-    g->par_y0 = int(off / 64);
     return true;
 }
 
@@ -639,6 +646,38 @@ bool render(uint32_t *out, int width, float alpha, bool full)
         }
     }
     return true;
+}
+
+// Development: per-frame flicker in the game's own picture (bitplane 5) and
+// in the redraw, and how far apart the two are (JP2_FLICKER=1).
+void flicker_check()
+{
+    static uint8_t last_game[320 * kHeight];
+    static uint32_t last_mine[320 * kHeight], mine[320 * kHeight];
+    static bool have;
+    Geometry g;
+    if (!shown_cur.valid)
+        return;
+    g = shown_cur.g;
+    if (!render(mine, g.w, 1.0f, true))
+        return;
+    int game_changed = 0, mine_changed = 0, apart = 0, n = 0;
+    for (int y = 0; y < kHeight; y++)
+        for (int x = 0; x < g.w; x++, n++) {
+            int line = g.v0 + y - kFbY0;
+            uint8_t b = (index_buffer[line * kFbW + (g.h0 + x - kFbX0)] >> 4) & 1;
+            game_changed += have && b != last_game[y * g.w + x];
+            mine_changed += have && mine[y * g.w + x] != last_mine[y * g.w + x];
+            apart += mine[y * g.w + x] != framebuffer[line * kFbW + (g.h0 + x - kFbX0)] &&
+                     !(sprite_buffer[line * kFbW + (g.h0 + x - kFbX0)] & 0x80);
+            last_game[y * g.w + x] = b;
+            last_mine[y * g.w + x] = mine[y * g.w + x];
+        }
+    have = true;
+    std::printf("flicker: game plane-5 changed %5.2f%%  redraw changed %5.2f%%  redraw vs game %5.2f%%  bpl5 %06X blit %d "
+                "origin %d,%d\n",
+                100.0 * game_changed / n, 100.0 * mine_changed / n, 100.0 * apart / n, playfield_start.bpl[4],
+                blit_for_shown() ? 1 : 0, g.par_x0, g.par_y0);
 }
 
 void self_check()

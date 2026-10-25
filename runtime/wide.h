@@ -42,5 +42,6 @@ bool playing();
 
 // Development check: how far the redrawn middle strays from the real picture.
 void self_check();
+void flicker_check();
 
 } // namespace wide

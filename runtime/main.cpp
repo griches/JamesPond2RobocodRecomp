@@ -254,6 +254,8 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
         wide::frame_done();
         if (std::getenv("JP2_WIDECHECK"))
             wide::self_check();
+        if (std::getenv("JP2_FLICKER"))
+            wide::flicker_check();
         record::frame();
         float buf[4096];
         int n;
