@@ -53,6 +53,15 @@ void cia_reset()
     key_wait = 0;
 }
 
+// Bit 1 of CIA-A port A drives the power LED low (lit), which also switches
+// in the audio filter. As an input (Kickstart sets it as an output) it is
+// pulled high.
+bool cia_led_filter()
+{
+    const Cia &c = cia[0];
+    return (c.ddra & 2) && !(c.pra & 2);
+}
+
 uint8_t cia_read(int which, int reg)
 {
     Cia &c = cia[which];

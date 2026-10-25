@@ -136,6 +136,7 @@ void cia_frame();                                // vertical sync (CIA-A TOD)
 uint8_t cia_read(int which, int reg);    // which: 0 = CIA-A ($BFE001), 1 = CIA-B ($BFD000)
 void cia_write(int which, int reg, uint8_t v);
 void cia_reset();
+bool cia_led_filter();                   // CIA-A drives the power LED, and with it the audio filter
 
 // ---- input ------------------------------------------------------------------
 struct Joystick {
@@ -146,6 +147,17 @@ void key_event(int amiga_keycode, bool down);
 
 // ---- audio out ----------------------------------------------------------------
 constexpr int kAudioRate = 48000;
+// How the four channels reach the speakers.
+struct AudioOutput {
+    enum Model { a500, a1200, clean } model = a500;   // whose analogue filters
+    float separation = 0.7f;                          // 1: hard left/right, 0: mono
+    float volume = 1.0f;
+};
+void set_audio_output(const AudioOutput &o);
+// The menu's sound preview: the last few seconds of the game, frozen, then
+// played round and round through the current output settings.
+void audio_preview_begin();
+int audio_preview_take(float *out, int frames);
 // Interleaved stereo float samples produced since the last call.
 int audio_take(float *out, int max_frames);
 

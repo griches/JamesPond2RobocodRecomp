@@ -172,6 +172,10 @@ bool boot(const char *adf_path, std::string *error)
     reset();
     std::memcpy(&ram[disk::kImageBase], image.data(), image.size());
 
+    // As Kickstart leaves CIA-A: overlay off, power LED lit (an output).
+    cia_write(0, 2, 0x03);
+    cia_write(0, 0, 0x00);
+
     // Memory list the game reads at $200: chip memory, then the extra block.
     write32(0x200, 0);
     write32(0x204, kChipSize);

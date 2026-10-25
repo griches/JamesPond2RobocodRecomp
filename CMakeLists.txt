@@ -24,27 +24,47 @@ target_include_directories(musashi PUBLIC ${MUSASHI} ${MUSASHI}/gen ${CMAKE_SOUR
 target_compile_definitions(musashi PUBLIC MUSASHI_CNF="musashi_conf.h")
 target_compile_options(musashi PRIVATE -w)
 
+# The menu's fonts (Inter, SIL OFL; Material Symbols, Apache 2.0; res/fonts), built into the program.
+set(FONT_SRC)
+foreach(font inter_regular:Inter-Regular inter_semibold:Inter-SemiBold icons:MaterialSymbolsRounded-subset)
+  string(REPLACE ":" ";" parts ${font})
+  list(GET parts 0 sym)
+  list(GET parts 1 file)
+  set(out ${CMAKE_BINARY_DIR}/font_${sym}.cpp)
+  add_custom_command(
+    OUTPUT ${out}
+    COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_SOURCE_DIR}/res/fonts/${file}.ttf -DOUT=${out} -DNAME=font_${sym}
+            -P ${CMAKE_SOURCE_DIR}/tools/embed.cmake
+    DEPENDS ${CMAKE_SOURCE_DIR}/res/fonts/${file}.ttf ${CMAKE_SOURCE_DIR}/tools/embed.cmake)
+  list(APPEND FONT_SRC ${out})
+endforeach()
+
 set(JP2_RUNTIME
+  ${FONT_SRC}
   runtime/blitter.cpp
   runtime/cia.cpp
   runtime/custom.cpp
   runtime/disk.cpp
   runtime/display.cpp
   runtime/game.cpp
+  runtime/glyphs.cpp
   runtime/main.cpp
   runtime/memory.cpp
+  runtime/menu.cpp
   runtime/musashi_bus.cpp
   runtime/overlay.cpp
   runtime/paula.cpp
   runtime/png.cpp
   runtime/record.cpp
+  runtime/settings.cpp
   runtime/state.cpp
   runtime/trace.cpp
+  runtime/ui.cpp
   runtime/wide.cpp)
 
 # Interpreter build: the reference, and the way to record code coverage.
 add_executable(jp2-interp ${JP2_RUNTIME} runtime/cpu_musashi.cpp)
-target_include_directories(jp2-interp PRIVATE runtime)
+target_include_directories(jp2-interp PRIVATE runtime vendor/stb)
 target_link_libraries(jp2-interp PRIVATE musashi SDL3::SDL3)
 
 # The recompiler.
@@ -78,7 +98,7 @@ if(JP2_ADF)
   target_compile_options(jp2-code PRIVATE -Wno-unused-label -Wno-unused-variable -Wno-parentheses-equality)
 
   add_executable(jp2 ${JP2_RUNTIME} runtime/cpu_recomp.cpp runtime/recomp_exc.cpp $<TARGET_OBJECTS:jp2-code>)
-  target_include_directories(jp2 PRIVATE runtime)
+  target_include_directories(jp2 PRIVATE runtime vendor/stb)
   target_link_libraries(jp2 PRIVATE musashi SDL3::SDL3)
   target_compile_definitions(jp2 PRIVATE JP2_COVERAGE_DIR="${CMAKE_SOURCE_DIR}/coverage")
 
