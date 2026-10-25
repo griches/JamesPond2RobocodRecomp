@@ -1,0 +1,8 @@
+# Never commit the game: the disk image, anything unpacked from it, and the
+# generated C (it is translated from the game code).
+gamedata/
+build/
+*.adf
+*.ipf
+.DS_Store
+__pycache__/
