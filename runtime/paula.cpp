@@ -2,6 +2,7 @@
 // player's audio interrupts arrive when the game expects them), mixed to
 // 48 kHz stereo. Channels 0 and 3 go left, 1 and 2 right.
 #include "amiga.h"
+#include "state.h"
 
 #include <cstring>
 #include <mutex>
@@ -169,6 +170,17 @@ int audio_take(float *out, int max_frames)
         n++;
     }
     return n;
+}
+
+void paula_state(StateIO &s)
+{
+    s.bytes(ch, sizeof ch);
+    s.io(out_phase);
+    s.bytes(acc, sizeof acc);
+    if (s.loading()) {
+        std::lock_guard<std::mutex> g(ring_lock);
+        ring_r = ring_w;
+    }
 }
 
 } // namespace amiga

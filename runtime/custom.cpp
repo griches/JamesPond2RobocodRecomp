@@ -1,5 +1,6 @@
 // Custom chip registers, interrupts, the copper and the per-line frame loop.
 #include "amiga.h"
+#include "state.h"
 
 #include <cstdio>
 #include <cstring>
@@ -280,6 +281,23 @@ void run_frame()
         paula_run_line();
         cia_run_line();
     }
+}
+
+void custom_state(StateIO &s)
+{
+    s.bytes(regs, sizeof regs);
+    s.io(intena);
+    s.io(intreq);
+    s.io(adkcon);
+    s.io(cur_line);
+    s.io(pal);
+    s.io(long_frame);
+    s.io(blitter_zero);
+    s.io(cop_pc);
+    s.io(cop_state);
+    s.io(cop_w1);
+    s.io(cop_w2);
+    s.io(cop_h);
 }
 
 } // namespace amiga

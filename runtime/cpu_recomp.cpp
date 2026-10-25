@@ -3,6 +3,7 @@
 // the recompiler didn't see (or memory that no longer matches what it
 // translated) to Musashi one instruction at a time.
 #include "amiga.h"
+#include "state.h"
 #include "cpu.h"
 #include "disk.h"
 #include "recomp_rt.h"
@@ -28,43 +29,52 @@ static uint8_t *coverage;          // marks instructions that had to be interpre
 static int64_t line_start;
 static std::unordered_map<uint32_t, uint64_t> interp_count;
 
-// ---- translated images and page validity ------------------------------------------------
+// ---- translated images and their validity --------------------------------------------------
+// A chunk (one generated function) runs as a unit: once entered it jumps
+// between its own instructions without coming back here. So it may only be
+// entered while every instruction in it still has the bytes it was
+// translated from. That is what lets the five music players, which share
+// their first few hundred bytes, sit at the same address.
 struct Loaded {
     const CodeImage *ci;
     std::vector<uint8_t> bytes;    // what it was translated from
     std::vector<Handler> table;    // by (pc - base) / 2
-    std::vector<uint8_t> len;      // instruction length by (pc - base) / 2, 0 = none
+    std::vector<uint8_t> len;      // instruction length, 0 = none
+    std::vector<uint8_t> ok;       // memory still holds those bytes
+    std::vector<int32_t> chunk;    // which chunk the instruction is in
 };
 static std::vector<Loaded> images;
+
+struct ChunkState {
+    uint32_t p0, p1;   // pages it covers
+    int bad;           // instructions whose bytes no longer match
+};
+static std::vector<ChunkState> chunks;
 
 constexpr int kPages = kRamSize >> 8;
 constexpr int kMaxCand = 8;
 static uint8_t cand_n[kPages];
 static uint8_t cand[kPages][kMaxCand];
-static uint8_t page_ok[kPages];     // bit k: candidate k matches memory
-
-// Every translated instruction that starts in the page must still have the
-// bytes it was translated from.
-static bool image_matches_page(const Loaded &im, int page)
-{
-    uint32_t lo = uint32_t(page) << 8, hi = lo + 256;
-    uint32_t b = im.ci->base, e = b + im.ci->size;
-    uint32_t from = std::max(lo, b) & ~1u, to = std::min(hi, e);
-    for (uint32_t a = from; a < to; a += 2) {
-        uint32_t o = a - b;
-        uint8_t n = im.len[o >> 1];
-        if (n && std::memcmp(&ram[a], &im.bytes[o], n) != 0)
-            return false;
-    }
-    return true;
-}
 
 static void revalidate(int page)
 {
-    page_ok[page] = 0;
-    for (int k = 0; k < cand_n[page]; k++)
-        if (image_matches_page(images[cand[page][k]], page))
-            page_ok[page] |= uint8_t(1 << k);
+    uint32_t lo = uint32_t(page) << 8, hi = lo + 256;
+    for (int k = 0; k < cand_n[page]; k++) {
+        Loaded &im = images[cand[page][k]];
+        uint32_t b = im.ci->base, e = b + im.ci->size;
+        uint32_t from = std::max(lo, b) & ~1u, to = std::min(hi, e);
+        for (uint32_t a = from; a < to; a += 2) {
+            uint32_t i = (a - b) >> 1;
+            uint8_t n = im.len[i];
+            if (!n)
+                continue;
+            uint8_t now = std::memcmp(&ram[a], &im.bytes[a - b], n) == 0;
+            if (now != im.ok[i]) {
+                chunks[im.chunk[i]].bad += now ? -1 : 1;
+                im.ok[i] = now;
+            }
+        }
+    }
     page_dirty[page] = 0;
 }
 
@@ -73,18 +83,20 @@ static inline Handler lookup(uint32_t pc)
     if (pc >= kRamSize)
         return nullptr;
     int page = int(pc >> 8);
-    if (page_dirty[page])
-        revalidate(page);
     for (int k = 0; k < cand_n[page]; k++) {
-        if (!(page_ok[page] & (1 << k)))
-            continue;
         const Loaded &im = images[cand[page][k]];
         uint32_t o = pc - im.ci->base;
-        if (o < im.ci->size) {
-            Handler h = im.table[o >> 1];
-            if (h)
-                return h;
-        }
+        if (o >= im.ci->size)
+            continue;
+        uint32_t i = o >> 1;
+        if (!im.table[i])
+            continue;
+        ChunkState &c = chunks[im.chunk[i]];
+        for (uint32_t p = c.p0; p <= c.p1; p++)
+            if (page_dirty[p])
+                revalidate(int(p));
+        if (c.bad == 0)
+            return im.table[i];
     }
     return nullptr;
 }
@@ -92,9 +104,11 @@ static inline Handler lookup(uint32_t pc)
 bool recomp_init(std::string *note)
 {
     images.clear();
+    chunks.clear();
     std::memset(cand_n, 0, sizeof cand_n);
     std::memset(code_bits, 0, sizeof code_bits);
     int unusable = 0;
+    std::unordered_map<Handler, int> chunk_of;
     for (int i = 0; i < code_image_count; i++) {
         const CodeImage &ci = code_images[i];
         Loaded im;
@@ -105,13 +119,26 @@ bool recomp_init(std::string *note)
             unusable++;
             continue;
         }
-        im.table.assign(ci.size / 2 + 1, nullptr);
-        im.len.assign(ci.size / 2 + 1, 0);
+        size_t slots = ci.size / 2 + 1;
+        im.table.assign(slots, nullptr);
+        im.len.assign(slots, 0);
+        im.ok.assign(slots, 0);
+        im.chunk.assign(slots, -1);
         for (size_t e = 0; e < ci.count; e++) {
             const CodeEntry &ce = ci.entries[e];
             uint32_t o = ce.pc - ci.base;
+            auto it = chunk_of.find(ce.fn);
+            if (it == chunk_of.end()) {
+                it = chunk_of.emplace(ce.fn, int(chunks.size())).first;
+                chunks.push_back({ce.pc >> 8, ce.pc >> 8, 0});
+            }
+            ChunkState &c = chunks[it->second];
+            c.p0 = std::min(c.p0, ce.pc >> 8);
+            c.p1 = std::max(c.p1, (ce.pc + ce.len - 1) >> 8);
+            c.bad++;   // nothing is trusted until checked
             im.table[o >> 1] = ce.fn;
             im.len[o >> 1] = uint8_t(ce.len);
+            im.chunk[o >> 1] = it->second;
             for (uint32_t k = 0; k < ce.len; k++) {
                 uint32_t a = ce.pc + k;
                 code_bits[a >> 3] |= uint8_t(1 << (a & 7));
@@ -119,7 +146,6 @@ bool recomp_init(std::string *note)
         }
         int idx = int(images.size());
         images.push_back(std::move(im));
-        const Loaded &l = images.back();
         for (size_t e = 0; e < ci.count; e++) {
             int page = int(ci.entries[e].pc >> 8);
             bool have = false;
@@ -128,7 +154,6 @@ bool recomp_init(std::string *note)
             if (!have && cand_n[page] < kMaxCand)
                 cand[page][cand_n[page]++] = uint8_t(idx);
         }
-        (void)l;
     }
     for (int p = 0; p < kPages; p++)
         page_dirty[p] = cand_n[p] ? 1 : 0;
@@ -298,6 +323,13 @@ void cpu_report()
                  (unsigned long long)total);
     for (size_t i = 0; i < v.size() && i < 12; i++)
         std::fprintf(stderr, "  $%06X  %llu\n", v[i].first, (unsigned long long)v[i].second);
+}
+
+void cpu_state(StateIO &s)
+{
+    s.io(cpu);
+    if (s.loading())
+        cpu.interp = 0;
 }
 
 } // namespace amiga

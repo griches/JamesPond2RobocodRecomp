@@ -33,7 +33,10 @@ uint32_t mask_of(int size) { return size == 1 ? 0xFFu : size == 2 ? 0xFFFFu : 0x
 
 struct Ea {
     enum Kind { DREG, AREG, MEM, IMM, BAD } kind = BAD;
-    int reg = 0, size = 0;
+    int mode = 0, reg = 0, size = 0;
+    bool pcrel() const { return mode == 7 && (reg == 2 || reg == 3); }
+    // can be written: a data register or memory that isn't PC-relative
+    bool alterable() const { return kind == DREG || (kind == MEM && !pcrel()); }
     uint32_t imm = 0;
     std::string addr;   // C expression for the address (a temp, or a constant)
     bool const_addr = false;
@@ -128,6 +131,7 @@ Ea Tx::ea(int mode, int reg, int size)
 {
     Ea e;
     e.size = size;
+    e.mode = mode;
     e.reg = reg;
     int step = (size == 1 && reg == 7) ? 2 : size;
     switch (mode) {
@@ -291,7 +295,7 @@ void Tx::bitop(int type, bool dynamic)
         return;
     }
     Ea e = ea(mode, reg, 1);
-    if (e.kind == Ea::AREG || (type && e.kind == Ea::IMM)) {
+    if (e.kind == Ea::AREG || (type && !e.alterable())) {
         bad_ = true;
         return;
     }
@@ -309,7 +313,7 @@ void Tx::immop(int kind, int size)
     uint32_t imm = size == 4 ? next32() : size == 2 ? next16() : (next16() & 0xFF);
     int mode = (op_ >> 3) & 7, reg = op_ & 7;
     Ea e = ea(mode, reg, size);
-    if (e.kind == Ea::AREG || e.kind == Ea::IMM) {
+    if (!e.alterable()) {
         bad_ = true;
         return;
     }
@@ -425,7 +429,7 @@ void Tx::move(int size)
         return;
     }
     Ea d = ea(dmode, dreg, size);
-    if (d.kind == Ea::IMM || d.kind == Ea::AREG) {
+    if (!d.alterable()) {
         bad_ = true;
         return;
     }
@@ -626,7 +630,7 @@ void Tx::group4()
     }
     if ((op_ & 0xFFC0) == 0x40C0) {   // MOVE from SR
         Ea e = ea(mode, reg, 2);
-        if (e.kind == Ea::AREG || e.kind == Ea::IMM) {
+        if (!e.alterable()) {
             bad_ = true;
             return;
         }
@@ -656,7 +660,7 @@ void Tx::group4()
     }
     if ((op_ & 0xFFC0) == 0x4800) {   // NBCD
         Ea e = ea(mode, reg, 1);
-        if (e.kind == Ea::AREG || e.kind == Ea::IMM) {
+        if (!e.alterable()) {
             bad_ = true;
             return;
         }
@@ -686,7 +690,7 @@ void Tx::group4()
     }
     if ((op_ & 0xFFC0) == 0x4AC0) {   // TAS
         Ea e = ea(mode, reg, 1);
-        if (e.kind == Ea::AREG || e.kind == Ea::IMM) {
+        if (!e.alterable()) {
             bad_ = true;
             return;
         }
@@ -707,7 +711,7 @@ void Tx::group4()
     case 0x4600:   // NOT
     case 0x4200: { // CLR
         Ea e = ea(mode, reg, sz);
-        if (e.kind == Ea::AREG || e.kind == Ea::IMM) {
+        if (!e.alterable()) {
             bad_ = true;
             return;
         }
@@ -727,9 +731,9 @@ void Tx::group4()
         write(e, r);
         return;
     }
-    case 0x4A00: { // TST
+    case 0x4A00: { // TST (no An, PC-relative or immediate before the 68020)
         Ea e = ea(mode, reg, sz);
-        if (e.kind == Ea::AREG && sz == 1) {
+        if (e.kind == Ea::AREG || e.kind == Ea::IMM || e.pcrel()) {
             bad_ = true;
             return;
         }
@@ -758,7 +762,7 @@ void Tx::group5()
             return;
         }
         Ea e = ea(mode, reg, 1);   // Scc
-        if (e.kind == Ea::AREG || e.kind == Ea::IMM) {
+        if (!e.alterable()) {
             bad_ = true;
             return;
         }
@@ -771,7 +775,7 @@ void Tx::group5()
         q = 8;
     bool sub = op_ & 0x100;
     Ea e = ea(mode, reg, size);
-    if (e.kind == Ea::IMM || (e.kind == Ea::AREG && size == 1)) {
+    if (e.kind == Ea::IMM || e.pcrel() || (e.kind == Ea::AREG && size == 1)) {
         bad_ = true;
         return;
     }
@@ -853,7 +857,7 @@ void Tx::group8()
         return;
     }
     if (op_ & 0x100) {   // OR Dn,<ea>
-        if (e.kind == Ea::DREG || e.kind == Ea::IMM) {
+        if (e.kind != Ea::MEM || e.pcrel()) {
             bad_ = true;
             return;
         }
@@ -898,7 +902,7 @@ void Tx::addsub(bool add)
     }
     Ea e = ea(mode, reg, size);
     if (op_ & 0x100) {   // Dn,<ea>
-        if (e.kind != Ea::MEM) {
+        if (e.kind != Ea::MEM || e.pcrel()) {
             bad_ = true;
             return;
         }
@@ -937,7 +941,7 @@ void Tx::groupB()
             return;
         }
         Ea e = ea(mode, reg, size);   // EOR Dn,<ea>
-        if (e.kind == Ea::AREG || e.kind == Ea::IMM) {
+        if (!e.alterable()) {
             bad_ = true;
             return;
         }
@@ -999,7 +1003,7 @@ void Tx::groupC()
         return;
     }
     if (op_ & 0x100) {   // AND Dn,<ea>
-        if (e.kind != Ea::MEM) {
+        if (e.kind != Ea::MEM || e.pcrel()) {
             bad_ = true;
             return;
         }
@@ -1025,7 +1029,7 @@ void Tx::shifts()
         }
         int type = (op_ >> 9) & 3;
         Ea e = ea((op_ >> 3) & 7, op_ & 7, 2);
-        if (e.kind != Ea::MEM) {
+        if (e.kind != Ea::MEM || e.pcrel()) {
             bad_ = true;
             return;
         }

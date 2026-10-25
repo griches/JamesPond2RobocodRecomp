@@ -2,6 +2,7 @@
 // and the joystick fire button. CIA-A interrupts arrive as PORTS (level 2),
 // CIA-B as EXTER (level 6).
 #include "amiga.h"
+#include "state.h"
 
 #include <deque>
 #include <mutex>
@@ -213,6 +214,17 @@ void cia_run_line()
 void cia_frame()
 {
     cia[0].tod = (cia[0].tod + 1) & 0xFFFFFF;   // CIA-A counts frames
+}
+
+void cia_state(StateIO &s)
+{
+    s.bytes(cia, sizeof cia);
+    s.io(eclock_frac);
+    s.io(key_wait);
+    if (s.loading()) {
+        std::lock_guard<std::mutex> g(keys_lock);
+        keys.clear();
+    }
 }
 
 } // namespace amiga

@@ -50,10 +50,9 @@ void load(int file, uint32_t dest, uint32_t bytes, bool packed)
         loads.push_back({frame_no, file, dest, bytes, packed});
 }
 
-void finish()
+static size_t write_files()
 {
-    if (!on)
-        return;
+    size_t reached = 0;
     std::string base = out_dir + "/";
     if (FILE *f = std::fopen((base + "coverage.bin").c_str(), "wb")) {
         std::fwrite(coverage, 1, sizeof coverage, f);
@@ -71,7 +70,7 @@ void finish()
             words += w - s;
         }
         std::fclose(f);
-        std::printf("record: %zu instruction words reached\n", words);
+        reached = words;
     }
     if (FILE *f = std::fopen((base + "loads.txt").c_str(), "w")) {
         for (const Load &l : loads)
@@ -84,10 +83,24 @@ void finish()
             std::fprintf(f, "writer $%06X  wrote $%06X-$%06X  %u times  first frame %d\n", pc, w.lo, w.hi, w.count,
                          w.first_frame);
         std::fclose(f);
-        std::printf("record: %zu instructions wrote into code\n", code_writes.size());
     }
+    return reached;
 }
 
+void flush()
+{
+    if (on)
+        write_files();
+}
+
+void finish()
+{
+    if (!on)
+        return;
+    size_t words = write_files();
+    std::printf("record: %zu instruction words reached, %zu instructions wrote into code\n", words, code_writes.size());
+    on = false;
+}
 } // namespace record
 
 namespace amiga {

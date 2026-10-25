@@ -8,13 +8,16 @@
 #include "amiga.h"
 #include "cpu.h"
 #include "game.h"
+#include "overlay.h"
 #include "png.h"
 #include "record.h"
+#include "state.h"
 
 #include <SDL3/SDL.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -39,16 +42,31 @@ struct Press {
     int key;   // -1 for none
 };
 
+// Amiga raw key code for a name: a letter, a digit, F1-F10, or a few others.
 int amiga_key_by_name(const std::string &n)
 {
     static const struct { const char *name; int code; } names[] = {
-        {"ESC", 0x45}, {"SPACE", 0x40}, {"RETURN", 0x44}, {"F1", 0x50}, {"F2", 0x51},
-        {"F3", 0x52}, {"F4", 0x53}, {"F5", 0x54}, {"F6", 0x55}, {"F7", 0x56}, {"F8", 0x57},
-        {"F9", 0x58}, {"F10", 0x59}, {"P", 0x19}, {"HELP", 0x5F},
+        {"ESC", 0x45}, {"SPACE", 0x40}, {"RETURN", 0x44}, {"ENTER", 0x44}, {"HELP", 0x5F}, {"DEL", 0x46},
+        {"BACKSPACE", 0x41}, {"TAB", 0x42},
     };
     for (auto &e : names)
         if (n == e.name)
             return e.code;
+    if (n.size() >= 2 && n[0] == 'F') {
+        int f = std::atoi(n.c_str() + 1);
+        if (f >= 1 && f <= 10)
+            return 0x4F + f;
+    }
+    if (n.size() == 1) {
+        static const char *rows[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+        static const int first[] = {0x01, 0x10, 0x20, 0x31};
+        char c = char(std::toupper(static_cast<unsigned char>(n[0])));
+        for (int r = 0; r < 4; r++)
+            if (const char *p = std::strchr(rows[r], c))
+                return first[r] + int(p - rows[r]);
+        if (c == ' ')
+            return 0x40;
+    }
     return -1;
 }
 
@@ -67,6 +85,19 @@ std::vector<Press> parse_input(const char *spec)
         Press p{};
         p.key = -1;
         std::string range = item.substr(0, colon), what = item.substr(colon + 1);
+        if (what.rfind("type=", 0) == 0) {
+            int at = std::atoi(range.c_str());
+            std::string text = what.substr(5);
+            for (size_t i = 0; i < text.size(); i++) {
+                Press k{};
+                k.from = at + int(i) * 4;
+                k.to = k.from + 2;
+                k.key = amiga_key_by_name(std::string(1, text[i]));
+                if (k.key >= 0)
+                    out.push_back(k);
+            }
+            continue;
+        }
         size_t dash = range.find('-');
         p.from = std::atoi(range.c_str());
         p.to = dash == std::string::npos ? p.from : std::atoi(range.c_str() + dash + 1);
@@ -108,6 +139,64 @@ void apply_script(const std::vector<Press> &script, int frame)
     joy = j;
 }
 
+bool read_file(const std::string &path, std::vector<uint8_t> &out)
+{
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    out.resize(n > 0 ? size_t(n) : 0);
+    bool ok = n > 0 && std::fread(out.data(), 1, out.size(), f) == out.size();
+    std::fclose(f);
+    return ok;
+}
+
+bool write_file(const std::string &path, const std::vector<uint8_t> &data)
+{
+    std::string tmp = path + ".tmp";
+    FILE *f = std::fopen(tmp.c_str(), "wb");
+    if (!f)
+        return false;
+    bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    ok = std::fclose(f) == 0 && ok;
+    return ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+// The quick save lives with the user's app data, so it outlasts rebuilds.
+std::string quicksave_path()
+{
+    static std::string path;
+    if (path.empty()) {
+        if (char *dir = SDL_GetPrefPath("bouncingball", "James Pond 2")) {
+            path = std::string(dir) + "quicksave.jp2s";
+            SDL_free(dir);
+        }
+    }
+    return path;
+}
+
+// Returns the message to show.
+const char *quick_save(const std::string &path)
+{
+    std::vector<uint8_t> data;
+    return save_state(data) && !path.empty() && write_file(path, data) ? "QUICK SAVED" : "SAVE FAILED";
+}
+
+const char *quick_load(const std::string &path)
+{
+    std::vector<uint8_t> data;
+    if (path.empty() || !read_file(path, data))
+        return "NO QUICK SAVE YET";
+    std::string err;
+    if (!load_state(data, &err)) {
+        std::fprintf(stderr, "quick load: %s\n", err.c_str());
+        return "LOAD FAILED";
+    }
+    return "LOADED";
+}
+
 void save_view(const char *path)
 {
     write_png(path, &framebuffer[kViewY * kFbW + kViewX], kViewW, kViewH, kFbW);
@@ -139,8 +228,11 @@ int amiga_key(SDL_Scancode sc)
     return -1;
 }
 
-int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<Press> &script)
+int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<Press> &script,
+                 const std::string &load_from, int save_frame, const std::string &save_to)
 {
+    if (!load_from.empty())
+        std::printf("load %s: %s\n", load_from.c_str(), quick_load(load_from));
     float peak = 0;
     int loud_frames = 0;
     for (int f = 1; f <= frames; f++) {
@@ -159,6 +251,8 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
         for (const Shot &s : shots)
             if (s.frame == f)
                 save_view(s.path.c_str());
+        if (f == save_frame)
+            std::printf("save at frame %d: %s\n", f, quick_save(save_to));
     }
     std::printf("audio: peak %.3f, %d of %d frames with sound\n", peak, loud_frames, frames);
     record::finish();
@@ -188,6 +282,12 @@ int run_window()
     SDL_Gamepad *pad = nullptr;
     Joystick keys{}, padj{};
     bool running = true;
+    bool want_save = false, want_load = false;
+    bool digits_to_game = false;
+    const char *message = nullptr;
+    uint64_t message_until = 0;
+    std::vector<uint32_t> present(size_t(kViewW) * kViewH);
+    long frames_run = 0;
     uint64_t next = SDL_GetTicksNS();
     const uint64_t frame_ns = 1000000000ull / 50;
 
@@ -202,10 +302,33 @@ int run_window()
                 if (!pad)
                     pad = SDL_OpenGamepad(e.gdevice.which);
                 break;
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                // Back / Share / View: quick save. Start / Options / Menu: quick load.
+                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
+                    want_save = true;
+                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START)
+                    want_load = true;
+                break;
             case SDL_EVENT_KEY_DOWN:
             case SDL_EVENT_KEY_UP: {
                 bool down = e.type == SDL_EVENT_KEY_DOWN;
                 SDL_Scancode sc = e.key.scancode;
+                // The cheat map selector (M) wants a section number typed on the
+                // number keys: hand them to the game until Return or Esc.
+                if (down && !e.key.repeat) {
+                    if (sc == SDL_SCANCODE_M)
+                        digits_to_game = true;
+                    else if (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_ESCAPE)
+                        digits_to_game = false;
+                }
+                // Quick save 1 (or F5), quick load 2 (or F8): ours, not the game's.
+                // Its cheat mode uses letters, Enter, F6, F7, F9 and F10.
+                bool digit = sc == SDL_SCANCODE_1 || sc == SDL_SCANCODE_2;
+                if ((digit && !digits_to_game) || sc == SDL_SCANCODE_F5 || sc == SDL_SCANCODE_F8) {
+                    if (down && !e.key.repeat)
+                        (sc == SDL_SCANCODE_1 || sc == SDL_SCANCODE_F5 ? want_save : want_load) = true;
+                    break;
+                }
                 if (sc == SDL_SCANCODE_UP) keys.up = down;
                 else if (sc == SDL_SCANCODE_DOWN) keys.down = down;
                 else if (sc == SDL_SCANCODE_LEFT) keys.left = down;
@@ -240,10 +363,18 @@ int run_window()
         joy.fire2 = keys.fire2 || padj.fire2;
 
         uint64_t now = SDL_GetTicksNS();
+        // Between frames, so the machine is in a steady state.
+        if (want_save || want_load) {
+            message = want_save ? quick_save(quicksave_path()) : quick_load(quicksave_path());
+            message_until = now + 2000000000ull;
+            want_save = want_load = false;
+        }
         int ran = 0;
         while (now >= next && ran < 3) {
             run_frame();
             record::frame();
+            if (++frames_run % 3000 == 0)
+                record::flush();   // keep the play recording even if the game is killed
             next += frame_ns;
             ran++;
         }
@@ -255,7 +386,15 @@ int run_window()
             while ((n = audio_take(buf, 2048)) > 0)
                 if (audio)
                     SDL_PutAudioStreamData(audio, buf, n * 2 * int(sizeof(float)));
-            SDL_UpdateTexture(tex, nullptr, &framebuffer[kViewY * kFbW + kViewX], kFbW * 4);
+        }
+        if (ran || message) {
+            for (int y = 0; y < kViewH; y++)
+                std::memcpy(&present[size_t(y) * kViewW], &framebuffer[(kViewY + y) * kFbW + kViewX], kViewW * 4);
+            if (message && now < message_until)
+                draw_message(present.data(), kViewW, kViewH, message);
+            else
+                message = nullptr;
+            SDL_UpdateTexture(tex, nullptr, present.data(), kViewW * 4);
         }
         SDL_RenderClear(ren);
         SDL_RenderTexture(ren, tex, nullptr, nullptr);
@@ -277,6 +416,8 @@ int main(int argc, char **argv)
     std::vector<Press> script;
     const char *record_dir = nullptr;
     bool cheat = false;
+    std::string load_from, save_to;
+    int save_frame = -1;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--adf") && i + 1 < argc) {
             adf = argv[++i];
@@ -293,6 +434,15 @@ int main(int argc, char **argv)
             record_dir = argv[++i];
         } else if (!std::strcmp(argv[i], "--cheat")) {
             cheat = true;
+        } else if (!std::strcmp(argv[i], "--load") && i + 1 < argc) {
+            load_from = argv[++i];
+        } else if (!std::strcmp(argv[i], "--save-at") && i + 1 < argc) {
+            const char *v = argv[++i];
+            const char *colon = std::strchr(v, ':');
+            if (colon) {
+                save_frame = std::atoi(v);
+                save_to = colon + 1;
+            }
         }
     }
     // Double-clicked app: the disk image sits beside the program (inside the
@@ -335,6 +485,6 @@ int main(int argc, char **argv)
     if (cheat)
         game::enable_cheat();
     if (headless)
-        return run_headless(headless, shots, script);
+        return run_headless(headless, shots, script, load_from, save_frame, save_to);
     return run_window();
 }

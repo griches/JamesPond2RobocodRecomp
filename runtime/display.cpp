@@ -2,6 +2,7 @@
 // line at a time. The copper calls display_catch_up() before each register
 // write, so colour changes part way along a line land where they should.
 #include "amiga.h"
+#include "state.h"
 
 #include <cstring>
 
@@ -356,5 +357,7 @@ void display_line_end()
     if (drawn_to < kLineX)
         draw_span(drawn_to, kLineX);
 }
+
+void display_state(StateIO &s) { s.bytes(spr, sizeof spr); }
 
 } // namespace amiga

@@ -36,7 +36,7 @@ struct Image {
     std::map<uint32_t, Insn> code;   // by pc
     std::vector<uint32_t> work;
 
-    bool contains(uint32_t a) const { return a >= base && a + 2 <= base + bytes.size(); }
+    bool contains(uint32_t a) const { return a >= base && uint64_t(a - base) + 2 <= bytes.size(); }
     uint16_t word(uint32_t a) const
     {
         if (!contains(a))
@@ -128,6 +128,63 @@ void trace(Image &img)
                 break;
         }
     }
+}
+
+// Does code starting at `a` look like a routine? It must decode cleanly,
+// without anything the translator can't handle or an exception, branch only
+// to even addresses inside the image, and reach a return or jump within a
+// few dozen instructions.
+bool plausible(const Image &img, uint32_t a)
+{
+    if ((a & 1) || !img.contains(a))
+        return false;
+    if (img.word(a) == 0 && img.word(a + 2) == 0)
+        return false;
+    uint32_t pc = a;
+    for (int i = 0; i < 48; i++) {
+        if (!img.contains(pc))
+            return false;
+        Insn in = translate(pc, [&](uint32_t x) { return img.word(x); });
+        if (in.flow == Insn::INTERP || in.flow == Insn::EXCEPT)
+            return false;
+        if ((in.flow == Insn::JUMP || in.flow == Insn::BRANCH) && ((in.target & 1) || !img.contains(in.target)))
+            return false;
+        if ((in.flow == Insn::JUMP || in.flow == Insn::DYNAMIC) && !in.call)
+            return true;
+        pc += in.len;
+    }
+    return false;
+}
+
+// Code reached only through data: tables of routine addresses (objects,
+// bosses) and addresses built with pc-relative lea/pea (interrupt vectors).
+void seed_from_data(Image &img)
+{
+    size_t candidates = 0, kept = 0;
+    std::set<uint32_t> found;
+    for (uint32_t o = 0; o + 4 <= img.bytes.size(); o += 2) {
+        uint32_t at = img.base + o;
+        uint32_t v = uint32_t(img.word(at)) << 16 | img.word(at + 2);
+        if (img.contains(v) && !(v & 1)) {
+            candidates++;
+            if (!found.count(v) && plausible(img, v))
+                found.insert(v);
+        }
+        uint16_t w = img.word(at);
+        if ((w & 0xF1FF) == 0x41FA || w == 0x487A) {   // lea d16(pc),An / pea d16(pc)
+            uint32_t t = at + 2 + uint32_t(int32_t(int16_t(img.word(at + 2))));
+            candidates++;
+            if (!found.count(t) && plausible(img, t))
+                found.insert(t);
+        }
+    }
+    for (uint32_t a : found) {
+        if (!img.code.count(a)) {
+            img.work.push_back(a);
+            kept++;
+        }
+    }
+    std::printf("%-8s data scan: %zu candidates, %zu new entry points\n", img.name.c_str(), candidates, kept);
 }
 
 struct Chunk {
@@ -350,6 +407,7 @@ int main(int argc, char **argv)
     std::vector<std::string> coverage;
     std::vector<uint32_t> seeds;
     int files = 32;
+    bool data_scan = true;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--adf") && i + 1 < argc)
             adf = argv[++i];
@@ -363,6 +421,8 @@ int main(int argc, char **argv)
             test_out = argv[++i];
         else if (!std::strcmp(argv[i], "--break") && i + 1 < argc)
             breaks.insert(uint32_t(std::strtoul(argv[++i], nullptr, 16)));
+        else if (!std::strcmp(argv[i], "--no-data-scan"))
+            data_scan = false;
         else if (!std::strcmp(argv[i], "--files") && i + 1 < argc)
             files = std::atoi(argv[++i]);
     }
@@ -412,6 +472,11 @@ int main(int argc, char **argv)
     }
     size_t total = 0, interp = 0;
     std::vector<Chunk> chunks;
+    // Follow everything known for certain first, then add what the data scan
+    // finds (main program only: the music players are reached by their table).
+    trace(images[0]);
+    if (data_scan)
+        seed_from_data(images[0]);
     for (Image &img : images) {
         trace(img);
         for (auto &[pc, in] : img.code)

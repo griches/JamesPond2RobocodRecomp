@@ -2,6 +2,7 @@
 // once the recompiled code exists, as the reference it is checked against and
 // the fallback for any code the recompiler did not see.
 #include "amiga.h"
+#include "state.h"
 #include "cpu.h"
 
 extern "C" {
@@ -86,6 +87,21 @@ void cpu_irq_changed()
     // this one; cpu_run starts the next with the new level.
     m68k_set_irq(irq_level());
     m68k_end_timeslice();
+}
+
+void cpu_state(StateIO &s)
+{
+    static const m68k_register_t order[] = {
+        M68K_REG_SR, M68K_REG_D0, M68K_REG_D1, M68K_REG_D2, M68K_REG_D3, M68K_REG_D4, M68K_REG_D5, M68K_REG_D6,
+        M68K_REG_D7, M68K_REG_A0, M68K_REG_A1, M68K_REG_A2, M68K_REG_A3, M68K_REG_A4, M68K_REG_A5, M68K_REG_A6,
+        M68K_REG_A7, M68K_REG_USP, M68K_REG_ISP, M68K_REG_PC,
+    };
+    for (m68k_register_t r : order) {
+        uint32_t v = s.loading() ? 0 : m68k_get_reg(nullptr, r);
+        s.io(v);
+        if (s.loading() && s.ok())
+            m68k_set_reg(r, v);
+    }
 }
 
 } // namespace amiga

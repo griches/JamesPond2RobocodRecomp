@@ -40,8 +40,10 @@ extern uint8_t code_bits[kRamSize >> 3];
 extern uint8_t page_dirty[kRamSize >> 8];
 inline void touch(uint32_t a)
 {
-    if (code_bits[a >> 3] & (1u << (a & 7)))
+    if (code_bits[a >> 3] & (1u << (a & 7))) {
         page_dirty[a >> 8] = 1;
+        page_dirty[((a - 10) & (kRamSize - 1)) >> 8] = 1;   // an instruction may start in the page before
+    }
 }
 void loaded(uint32_t addr, uint32_t bytes);   // bulk write (disk loads)
 extern uint32_t framebuffer[kFbW * kFbH];   // 0xAARRGGBB

@@ -34,9 +34,11 @@ set(JP2_RUNTIME
   runtime/main.cpp
   runtime/memory.cpp
   runtime/musashi_bus.cpp
+  runtime/overlay.cpp
   runtime/paula.cpp
   runtime/png.cpp
-  runtime/record.cpp)
+  runtime/record.cpp
+  runtime/state.cpp)
 
 # Interpreter build: the reference, and the way to record code coverage.
 add_executable(jp2-interp ${JP2_RUNTIME} runtime/cpu_musashi.cpp)
@@ -56,7 +58,7 @@ if(JP2_ADF)
   endforeach()
   # Coverage recorded with `jp2-interp --record dir` (coverage.bin) helps the
   # recompiler find code reached only through jump tables and pointers.
-  file(GLOB_RECURSE COVERAGE_FILES ${CMAKE_SOURCE_DIR}/coverage/*.bin)
+  file(GLOB_RECURSE COVERAGE_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/coverage/*.bin)
   set(COVERAGE_ARGS)
   foreach(c ${COVERAGE_FILES})
     list(APPEND COVERAGE_ARGS --coverage ${c})
@@ -71,7 +73,7 @@ if(JP2_ADF)
 
   add_library(jp2-code OBJECT ${GEN_CODE} ${GEN}/tables.cpp)
   target_include_directories(jp2-code PRIVATE runtime)
-  target_compile_options(jp2-code PRIVATE -Wno-unused-label -Wno-unused-variable)
+  target_compile_options(jp2-code PRIVATE -Wno-unused-label -Wno-unused-variable -Wno-parentheses-equality)
 
   add_executable(jp2 ${JP2_RUNTIME} runtime/cpu_recomp.cpp runtime/recomp_exc.cpp $<TARGET_OBJECTS:jp2-code>)
   target_include_directories(jp2 PRIVATE runtime)
@@ -81,7 +83,7 @@ if(JP2_ADF)
   add_executable(jp2-difftest tools/recomp/difftest.cpp runtime/disk.cpp runtime/recomp_exc.cpp
                  ${GEN}/tests.cpp $<TARGET_OBJECTS:jp2-code>)
   target_include_directories(jp2-difftest PRIVATE runtime)
-  target_compile_options(jp2-difftest PRIVATE -Wno-unused-label -Wno-unused-variable)
+  target_compile_options(jp2-difftest PRIVATE -Wno-unused-label -Wno-unused-variable -Wno-parentheses-equality)
   target_link_libraries(jp2-difftest PRIVATE musashi)
 endif()
 
