@@ -9,6 +9,10 @@
 namespace amiga {
 
 uint32_t framebuffer[kFbW * kFbH];
+uint8_t index_buffer[kFbW * kFbH];
+uint8_t sprite_buffer[kFbW * kFbH];
+uint16_t line_palette[kFbH][32];
+PlayfieldStart playfield_start;
 
 // Copper writes land at colour clock h; on screen that is lowres column 2h+1.
 static inline int cck_to_x(int h) { return 2 * h + 1; }
@@ -59,6 +63,7 @@ void display_frame_start()
 {
     for (Sprite &s : spr)
         s.state = Sprite::FETCH_CTL;
+    playfield_start.line = -1;
 }
 
 static uint32_t spr_pt(int n) { return uint32_t(regs[(0x120 >> 1) + n * 2]) << 16 | regs[(0x122 >> 1) + n * 2]; }
@@ -193,6 +198,17 @@ static void fetch_line()
     if (np == 0)
         return;
     bpl_active = true;
+    if (playfield_start.line < 0) {
+        playfield_start.line = cur_line;
+        for (int p = 0; p < 6; p++)
+            playfield_start.bpl[p] = bpl_pt(p);
+        playfield_start.bplcon0 = regs[0x100 >> 1];
+        playfield_start.bplcon1 = regs[0x102 >> 1];
+        playfield_start.diwstrt = regs[0x08E >> 1];
+        playfield_start.diwstop = regs[0x090 >> 1];
+        playfield_start.ddfstrt = regs[0x092 >> 1];
+        playfield_start.ddfstop = regs[0x094 >> 1];
+    }
 
     int strt = regs[0x092 >> 1] & 0xFC, stop = regs[0x094 >> 1] & 0xFC;
     bool hr = hires();
@@ -291,6 +307,7 @@ static void draw_span(int x0, int x1)
 
     for (int x = x0 < kFbX0 ? kFbX0 : x0; x < x1 && x < kFbX0 + kFbW; x++) {
         uint32_t out;
+        int shown_sprite = 0;
         if (!in_v || x < h0 || x >= h1) {
             out = border;
         } else {
@@ -319,11 +336,16 @@ static void draw_span(int x0, int x1)
             if (s) {
                 int pair = spr_pair[x];
                 int prio = owner == 1 ? pf1p : pf2p;
-                if (owner == 0 || pair < prio)
+                if (owner == 0 || pair < prio) {
                     out = rgb12(col[s]);
+                    shown_sprite = s;
+                }
             }
         }
         row[x - kFbX0] = out;
+        sprite_buffer[(cur_line - kFbY0) * kFbW + (x - kFbX0)] = uint8_t(shown_sprite);
+        index_buffer[(cur_line - kFbY0) * kFbW + (x - kFbX0)] =
+            (!in_v || x < h0 || x >= h1 || !bpl_active) ? 0 : pf_index[x];
     }
 }
 
@@ -356,6 +378,9 @@ void display_line_end()
         fetch_line();
     if (drawn_to < kLineX)
         draw_span(drawn_to, kLineX);
+    if (cur_line >= kFbY0 && cur_line < kFbY0 + kFbH)
+        for (int c = 0; c < 32; c++)
+            line_palette[cur_line - kFbY0][c] = regs[(0x180 >> 1) + c];
 }
 
 void display_state(StateIO &s) { s.bytes(spr, sizeof spr); }

@@ -325,11 +325,31 @@ void cpu_report()
         std::fprintf(stderr, "  $%06X  %llu\n", v[i].first, (unsigned long long)v[i].second);
 }
 
+// Same layout as the interpreter backend, so saves move between builds.
 void cpu_state(StateIO &s)
 {
-    s.io(cpu);
-    if (s.loading())
+    if (s.loading() && loading_version == 1) {   // the struct as it was
+        s.io(cpu);
         cpu.interp = 0;
+        return;
+    }
+    uint32_t sr = get_sr(), stopped = cpu.stopped;
+    for (uint32_t &r : cpu.d)
+        s.io(r);
+    for (uint32_t &r : cpu.a)
+        s.io(r);
+    s.io(cpu.other_sp);
+    s.io(cpu.pc);
+    s.io(sr);
+    s.io(stopped);
+    if (s.loading()) {
+        cpu.s = (sr >> 13) & 1;
+        cpu.t = (sr >> 15) & 1;
+        cpu.mask = (sr >> 8) & 7;
+        set_ccr(sr);
+        cpu.stopped = uint8_t(stopped);
+        cpu.interp = 0;
+    }
 }
 
 } // namespace amiga

@@ -1,5 +1,7 @@
 // Custom chip registers, interrupts, the copper and the per-line frame loop.
 #include "amiga.h"
+#include "cpu.h"
+#include "trace.h"
 #include "state.h"
 
 #include <cstdio>
@@ -110,8 +112,14 @@ static void set_clr(uint16_t &reg, uint16_t v, uint16_t mask)
         reg &= uint16_t(~(v & mask));
 }
 
+static bool in_copper;
+static int cop_h_now();
+
 void custom_write(uint32_t off, uint16_t v)
 {
+    if (trace::on())
+        trace::reg_write(cur_line, in_copper ? cop_h_now() : beam_hpos(), in_copper, off, v,
+                         in_copper ? 0 : cpu_instruction_pc());
     if (off >= 0x140 && off < 0x180) {
         regs[off >> 1] = v;
         display_sprite_reg(off, v);
@@ -189,6 +197,8 @@ static uint32_t cop_lc(int which)
     return uint32_t(regs[base >> 1]) << 16 | regs[(base + 2) >> 1];
 }
 
+static int cop_h_now() { return cop_h; }
+
 void copper_jump(int which)
 {
     cop_pc = cop_lc(which);
@@ -242,7 +252,9 @@ void copper_run_line(int line)
                 return;
             }
             display_catch_up(cop_h);
+            in_copper = true;
             custom_write(reg, w2);
+            in_copper = false;
         } else if (w2 & 1) {
             if (beam_past(line, cop_h, w1, w2))
                 cop_pc += 4;   // SKIP

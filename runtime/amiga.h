@@ -47,6 +47,19 @@ inline void touch(uint32_t a)
 }
 void loaded(uint32_t addr, uint32_t bytes);   // bulk write (disk loads)
 extern uint32_t framebuffer[kFbW * kFbH];   // 0xAARRGGBB
+extern uint8_t index_buffer[kFbW * kFbH];   // raw bitplane colour index per pixel (0 in the border)
+extern uint8_t sprite_buffer[kFbW * kFbH];  // sprite colour (16-31) where a sprite is shown, else 0
+
+// What the display used, kept for renderers that redraw the picture: the
+// colour registers at the end of every line, and the bitplane pointers and
+// scroll value as they stood on the first line bitplanes were fetched.
+extern uint16_t line_palette[kFbH][32];
+struct PlayfieldStart {
+    int line;             // -1 if no bitplanes were shown this frame
+    uint32_t bpl[6];
+    uint16_t bplcon0, bplcon1, diwstrt, diwstop, ddfstrt, ddfstop;
+};
+extern PlayfieldStart playfield_start;
 
 // ---- bus -------------------------------------------------------------------
 uint8_t read8(uint32_t a);

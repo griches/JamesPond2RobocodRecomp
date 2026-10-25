@@ -38,7 +38,9 @@ set(JP2_RUNTIME
   runtime/paula.cpp
   runtime/png.cpp
   runtime/record.cpp
-  runtime/state.cpp)
+  runtime/state.cpp
+  runtime/trace.cpp
+  runtime/wide.cpp)
 
 # Interpreter build: the reference, and the way to record code coverage.
 add_executable(jp2-interp ${JP2_RUNTIME} runtime/cpu_musashi.cpp)
@@ -67,7 +69,7 @@ if(JP2_ADF)
     OUTPUT ${GEN_CODE} ${GEN}/tables.cpp ${GEN}/tests.cpp
     COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN}
     COMMAND jp2-recomp --adf ${JP2_ADF} --out ${GEN} --test-out ${GEN}/tests.cpp
-            --break 16E00 --break 16D66 --break 16D9A ${COVERAGE_ARGS}
+            --break 16E00 --break 16D66 --break 16D9A --break 13DC6 --break 152C2 --break 4BA24 --break 1490C --break 11B18 ${COVERAGE_ARGS}
     DEPENDS jp2-recomp ${JP2_ADF} ${COVERAGE_FILES}
     COMMENT "Recompiling the 68000 code from ${JP2_ADF}")
 

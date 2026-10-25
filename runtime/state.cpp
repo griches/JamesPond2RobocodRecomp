@@ -5,10 +5,14 @@
 
 namespace amiga {
 
+uint32_t loading_version = 2;   // kVersion, set again after every load
+
 namespace {
 
 constexpr char kMagic[8] = {'J', 'P', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr uint32_t kVersion = 1;
+// 1: CPU registers in the recompiled backend's own layout. 2: one layout for
+// both CPU backends.
+constexpr uint32_t kVersion = 2;
 
 // Which game the save belongs to: the main program as unpacked from the disk.
 uint32_t game_id()
@@ -54,7 +58,7 @@ bool load_state(const std::vector<uint8_t> &in, std::string *error)
     s.bytes(magic, 8);
     s.io(version);
     s.io(id);
-    if (!s.ok() || std::memcmp(magic, kMagic, 8) != 0 || version != kVersion) {
+    if (!s.ok() || std::memcmp(magic, kMagic, 8) != 0 || version < 1 || version > kVersion) {
         *error = "not a save this version can read";
         return false;
     }
@@ -65,7 +69,9 @@ bool load_state(const std::vector<uint8_t> &in, std::string *error)
     // Check it all reads before touching the running machine.
     std::vector<uint8_t> backup;
     save_state(backup);
+    loading_version = version;
     machine(s);
+    loading_version = kVersion;
     if (!s.ok()) {
         StateIO undo(backup.data(), backup.size());
         char m[8];

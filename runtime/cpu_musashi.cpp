@@ -10,6 +10,7 @@ extern "C" {
 }
 
 #include <cstring>
+#include <vector>
 
 namespace amiga {
 
@@ -89,18 +90,42 @@ void cpu_irq_changed()
     m68k_end_timeslice();
 }
 
+// Same layout as the recompiled backend: D0-D7, A0-A7, the other stack
+// pointer, PC, SR, stopped.
 void cpu_state(StateIO &s)
 {
-    static const m68k_register_t order[] = {
-        M68K_REG_SR, M68K_REG_D0, M68K_REG_D1, M68K_REG_D2, M68K_REG_D3, M68K_REG_D4, M68K_REG_D5, M68K_REG_D6,
-        M68K_REG_D7, M68K_REG_A0, M68K_REG_A1, M68K_REG_A2, M68K_REG_A3, M68K_REG_A4, M68K_REG_A5, M68K_REG_A6,
-        M68K_REG_A7, M68K_REG_USP, M68K_REG_ISP, M68K_REG_PC,
-    };
-    for (m68k_register_t r : order) {
-        uint32_t v = s.loading() ? 0 : m68k_get_reg(nullptr, r);
-        s.io(v);
-        if (s.loading() && s.ok())
-            m68k_set_reg(r, v);
+    if (s.loading() && loading_version == 1) {   // not readable here; leave the CPU as it is
+        std::vector<uint8_t> skip(sizeof(uint32_t) * 20);
+        s.bytes(skip.data(), skip.size());
+        return;
+    }
+    uint32_t d[8], a[8], other, pc, sr, stopped = 0;
+    if (!s.loading()) {
+        for (int i = 0; i < 8; i++)
+            d[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_D0 + i));
+        for (int i = 0; i < 8; i++)
+            a[i] = m68k_get_reg(nullptr, m68k_register_t(M68K_REG_A0 + i));
+        sr = m68k_get_reg(nullptr, M68K_REG_SR);
+        other = m68k_get_reg(nullptr, (sr & 0x2000) ? M68K_REG_USP : M68K_REG_ISP);
+        pc = m68k_get_reg(nullptr, M68K_REG_PC);
+    }
+    for (uint32_t &r : d)
+        s.io(r);
+    for (uint32_t &r : a)
+        s.io(r);
+    s.io(other);
+    s.io(pc);
+    s.io(sr);
+    s.io(stopped);
+    if (s.loading() && s.ok()) {
+        m68k_set_reg(M68K_REG_SR, sr);
+        for (int i = 0; i < 8; i++)
+            m68k_set_reg(m68k_register_t(M68K_REG_D0 + i), d[i]);
+        for (int i = 0; i < 7; i++)
+            m68k_set_reg(m68k_register_t(M68K_REG_A0 + i), a[i]);
+        m68k_set_reg(M68K_REG_A7, a[7]);
+        m68k_set_reg((sr & 0x2000) ? M68K_REG_USP : M68K_REG_ISP, other);
+        m68k_set_reg(M68K_REG_PC, pc);
     }
 }
 

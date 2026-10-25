@@ -12,6 +12,8 @@
 #include "png.h"
 #include "record.h"
 #include "state.h"
+#include "trace.h"
+#include "wide.h"
 
 #include <SDL3/SDL.h>
 
@@ -34,7 +36,10 @@ constexpr int kViewW = 320, kViewH = 256;
 struct Shot {
     int frame;
     std::string path;
+    bool wide;
 };
+
+constexpr int kWideW = 368;   // 16:9 at the 208-line gameplay window
 
 struct Press {
     int from, to;
@@ -231,13 +236,22 @@ int amiga_key(SDL_Scancode sc)
 int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<Press> &script,
                  const std::string &load_from, int save_frame, const std::string &save_to)
 {
-    if (!load_from.empty())
+    if (!load_from.empty()) {
         std::printf("load %s: %s\n", load_from.c_str(), quick_load(load_from));
+        if (std::getenv("JP2_SHOWREGS"))
+            std::printf("  pc %06X sr %04X a7 %08X d0 %08X a0 %08X\n", cpu_reg(PC), cpu_reg(SR), cpu_reg(A7), cpu_reg(D0),
+                        cpu_reg(A0));
+    }
     float peak = 0;
     int loud_frames = 0;
     for (int f = 1; f <= frames; f++) {
         apply_script(script, f);
+        trace::frame_begin(f);
         run_frame();
+        trace::frame_end();
+        wide::frame_done();
+        if (std::getenv("JP2_WIDECHECK"))
+            wide::self_check();
         record::frame();
         float buf[4096];
         int n;
@@ -248,9 +262,15 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
         peak = std::max(peak, frame_peak);
         if (frame_peak > 0.01f)
             loud_frames++;
-        for (const Shot &s : shots)
-            if (s.frame == f)
+        for (const Shot &s : shots) {
+            if (s.frame != f)
+                continue;
+            static uint32_t wide_px[kWideW * wide::kHeight];
+            if (s.wide && wide::render(wide_px, kWideW))
+                write_png(s.path.c_str(), wide_px, kWideW, wide::kHeight, kWideW);
+            else
                 save_view(s.path.c_str());
+        }
         if (f == save_frame)
             std::printf("save at frame %d: %s\n", f, quick_save(save_to));
     }
@@ -273,6 +293,13 @@ int run_window()
     SDL_SetRenderLogicalPresentation(ren, kViewW, kViewH, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kViewW, kViewH);
     SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+    SDL_Texture *wide_tex =
+        SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kWideW, wide::kHeight);
+    SDL_SetTextureScaleMode(wide_tex, SDL_SCALEMODE_NEAREST);
+    std::vector<uint32_t> wide_px(size_t(kWideW) * wide::kHeight);
+    bool widescreen = true, showing_wide = false;
+    bool smooth = true;   // redraw between 50 Hz ticks at the display's rate
+    wide::set_view_extra((kWideW - 288) / 2);
 
     SDL_AudioSpec spec{SDL_AUDIO_F32, 2, kAudioRate};
     SDL_AudioStream *audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
@@ -323,6 +350,23 @@ int run_window()
                 }
                 // Quick save 1 (or F5), quick load 2 (or F8): ours, not the game's.
                 // Its cheat mode uses letters, Enter, F6, F7, F9 and F10.
+                if (sc == SDL_SCANCODE_4 && !digits_to_game) {   // smooth motion on / off
+                    if (down && !e.key.repeat) {
+                        smooth = !smooth;
+                        message = smooth ? "SMOOTH MOTION ON" : "SMOOTH MOTION OFF";
+                        message_until = SDL_GetTicksNS() + 2000000000ull;
+                    }
+                    break;
+                }
+                if (sc == SDL_SCANCODE_3 && !digits_to_game) {   // widescreen on / off
+                    if (down && !e.key.repeat) {
+                        widescreen = !widescreen;
+                        wide::set_view_extra(widescreen ? (kWideW - 288) / 2 : 0);
+                        message = widescreen ? "WIDESCREEN ON" : "WIDESCREEN OFF";
+                        message_until = SDL_GetTicksNS() + 2000000000ull;
+                    }
+                    break;
+                }
                 bool digit = sc == SDL_SCANCODE_1 || sc == SDL_SCANCODE_2;
                 if ((digit && !digits_to_game) || sc == SDL_SCANCODE_F5 || sc == SDL_SCANCODE_F8) {
                     if (down && !e.key.repeat)
@@ -372,6 +416,7 @@ int run_window()
         int ran = 0;
         while (now >= next && ran < 3) {
             run_frame();
+            wide::frame_done();
             record::frame();
             if (++frames_run % 3000 == 0)
                 record::flush();   // keep the play recording even if the game is killed
@@ -387,17 +432,31 @@ int run_window()
                 if (audio)
                     SDL_PutAudioStreamData(audio, buf, n * 2 * int(sizeof(float)));
         }
-        if (ran || message) {
-            for (int y = 0; y < kViewH; y++)
-                std::memcpy(&present[size_t(y) * kViewW], &framebuffer[(kViewY + y) * kFbW + kViewX], kViewW * 4);
-            if (message && now < message_until)
-                draw_message(present.data(), kViewW, kViewH, message);
-            else
+        // Where we are between the last game tick and the next (0..1).
+        float alpha = 1.0f - float(int64_t(next - now)) / float(frame_ns);
+        alpha = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
+        if (ran || message || (smooth && showing_wide)) {
+            bool show_message = message && now < message_until;
+            if (!show_message)
                 message = nullptr;
-            SDL_UpdateTexture(tex, nullptr, present.data(), kViewW * 4);
+            showing_wide = widescreen && wide::render(wide_px.data(), kWideW, alpha, smooth);
+            if (showing_wide) {
+                if (show_message)
+                    draw_message(wide_px.data(), kWideW, wide::kHeight, message);
+                SDL_UpdateTexture(wide_tex, nullptr, wide_px.data(), kWideW * 4);
+            } else {
+                for (int y = 0; y < kViewH; y++)
+                    std::memcpy(&present[size_t(y) * kViewW], &framebuffer[(kViewY + y) * kFbW + kViewX], kViewW * 4);
+                if (show_message)
+                    draw_message(present.data(), kViewW, kViewH, message);
+                SDL_UpdateTexture(tex, nullptr, present.data(), kViewW * 4);
+            }
         }
+        // Widescreen play fills a 16:9 window; everything else keeps the 4:3 picture.
+        SDL_SetRenderLogicalPresentation(ren, showing_wide ? kWideW : kViewW, showing_wide ? wide::kHeight : kViewH,
+                                         SDL_LOGICAL_PRESENTATION_LETTERBOX);
         SDL_RenderClear(ren);
-        SDL_RenderTexture(ren, tex, nullptr, nullptr);
+        SDL_RenderTexture(ren, showing_wide ? wide_tex : tex, nullptr, nullptr);
         SDL_RenderPresent(ren);
     }
     SDL_Quit();
@@ -427,13 +486,21 @@ int main(int argc, char **argv)
             const char *s = argv[++i];
             const char *colon = std::strchr(s, ':');
             if (colon)
-                shots.push_back({std::atoi(s), colon + 1});
+                shots.push_back({std::atoi(s), colon + 1, false});
+        } else if (!std::strcmp(argv[i], "--wide-shot") && i + 1 < argc) {
+            const char *s = argv[++i];
+            if (const char *colon = std::strchr(s, ':'))
+                shots.push_back({std::atoi(s), colon + 1, true});
         } else if (!std::strcmp(argv[i], "--input") && i + 1 < argc) {
             script = parse_input(argv[++i]);
         } else if (!std::strcmp(argv[i], "--record") && i + 1 < argc) {
             record_dir = argv[++i];
         } else if (!std::strcmp(argv[i], "--cheat")) {
             cheat = true;
+        } else if (!std::strcmp(argv[i], "--trace") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (const char *colon = std::strchr(v, ':'))
+                trace::arm(std::atoi(v), colon + 1);
         } else if (!std::strcmp(argv[i], "--load") && i + 1 < argc) {
             load_from = argv[++i];
         } else if (!std::strcmp(argv[i], "--save-at") && i + 1 < argc) {
@@ -480,6 +547,8 @@ int main(int argc, char **argv)
             record_dir = session_dir.c_str();
     }
 #endif
+    if (std::getenv("JP2_WIDE") || std::any_of(shots.begin(), shots.end(), [](const Shot &s) { return s.wide; }))
+        wide::set_view_extra((kWideW - 288) / 2);
     if (record_dir)
         record::start(record_dir);
     if (cheat)

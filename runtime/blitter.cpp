@@ -1,6 +1,9 @@
 // Blitter: area copies with shifts, masks, minterms and fills, and line mode.
 // A blit completes the moment BLTSIZE is written, so BBUSY never reads set.
 #include "amiga.h"
+#include "cpu.h"
+#include "trace.h"
+#include "wide.h"
 
 namespace amiga {
 
@@ -173,6 +176,9 @@ static void line_blit()
 
 void blitter_start()
 {
+    if (trace::on())
+        trace::blit(beam_line(), cpu_instruction_pc());
+    wide::blit_seen();
     if (R(0x042) & 1)
         line_blit();
     else

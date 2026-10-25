@@ -48,6 +48,9 @@ void paula_state(StateIO &s);
 void cia_state(StateIO &s);
 void cpu_state(StateIO &s);
 
+// Format version of the save being loaded (older ones are still read).
+extern uint32_t loading_version;
+
 bool save_state(std::vector<uint8_t> &out);
 bool load_state(const std::vector<uint8_t> &in, std::string *error);
 
