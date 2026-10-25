@@ -17,9 +17,11 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -266,7 +268,7 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
             if (s.frame != f)
                 continue;
             static uint32_t wide_px[kWideW * wide::kHeight];
-            if (s.wide && wide::render(wide_px, kWideW))
+            if (s.wide && wide::render(wide_px, kWideW, 1.0f, std::getenv("JP2_FULLSHOT") != nullptr))
                 write_png(s.path.c_str(), wide_px, kWideW, wide::kHeight, kWideW);
             else
                 save_view(s.path.c_str());
@@ -280,7 +282,17 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
     return 0;
 }
 
-int run_window()
+// Widescreen width that fills a window of this shape (the game window is 208
+// lines tall): 334 on the Steam Deck's 16:10, 370 at 16:9.
+int wide_width_for(int pw, int ph)
+{
+    if (pw <= 0 || ph <= 0)
+        return kWideW;
+    int w = int(208.0 * pw / ph + 0.5) & ~1;
+    return w < 288 ? 288 : w > wide::kMaxWidth ? wide::kMaxWidth : w;
+}
+
+int run_window(bool fullscreen, const std::string &load_from)
 {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -288,18 +300,19 @@ int run_window()
     }
     SDL_Window *win = SDL_CreateWindow("James Pond 2 - Codename RoboCod", kViewW * 3, kViewH * 3,
                                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (fullscreen)
+        SDL_SetWindowFullscreen(win, true);
     SDL_Renderer *ren = SDL_CreateRenderer(win, nullptr);
     SDL_SetRenderVSync(ren, 1);
     SDL_SetRenderLogicalPresentation(ren, kViewW, kViewH, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kViewW, kViewH);
     SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
-    SDL_Texture *wide_tex =
-        SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kWideW, wide::kHeight);
-    SDL_SetTextureScaleMode(wide_tex, SDL_SCALEMODE_NEAREST);
-    std::vector<uint32_t> wide_px(size_t(kWideW) * wide::kHeight);
+    int wide_w = 0;
+    SDL_Texture *wide_tex = nullptr;
+    std::vector<uint32_t> wide_px;
     bool widescreen = true, showing_wide = false;
     bool smooth = true;   // redraw between 50 Hz ticks at the display's rate
-    wide::set_view_extra((kWideW - 288) / 2);
+
 
     SDL_AudioSpec spec{SDL_AUDIO_F32, 2, kAudioRate};
     SDL_AudioStream *audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
@@ -315,6 +328,10 @@ int run_window()
     uint64_t message_until = 0;
     std::vector<uint32_t> present(size_t(kViewW) * kViewH);
     long frames_run = 0;
+    if (!load_from.empty()) {   // start from a save (--load)
+        message = quick_load(load_from);
+        message_until = SDL_GetTicksNS() + 2000000000ull;
+    }
     uint64_t next = SDL_GetTicksNS();
     const uint64_t frame_ns = 1000000000ull / 50;
 
@@ -330,11 +347,16 @@ int run_window()
                     pad = SDL_OpenGamepad(e.gdevice.which);
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-                // Back / Share / View: quick save. Start / Options / Menu: quick load.
-                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
+                // L: quick save. R: quick load. Y: smooth motion on / off.
+                if (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) {
                     want_save = true;
-                else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START)
+                } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) {
                     want_load = true;
+                } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_NORTH) {
+                    smooth = !smooth;
+                    message = smooth ? "SMOOTH MOTION ON" : "SMOOTH MOTION OFF";
+                    message_until = SDL_GetTicksNS() + 2000000000ull;
+                }
                 break;
             case SDL_EVENT_KEY_DOWN:
             case SDL_EVENT_KEY_UP: {
@@ -361,7 +383,7 @@ int run_window()
                 if (sc == SDL_SCANCODE_3 && !digits_to_game) {   // widescreen on / off
                     if (down && !e.key.repeat) {
                         widescreen = !widescreen;
-                        wide::set_view_extra(widescreen ? (kWideW - 288) / 2 : 0);
+                        wide::set_view_extra(widescreen ? (wide_w - 288) / 2 : 0);
                         message = widescreen ? "WIDESCREEN ON" : "WIDESCREEN OFF";
                         message_until = SDL_GetTicksNS() + 2000000000ull;
                     }
@@ -392,12 +414,19 @@ int run_window()
             const int dead = 12000;
             Sint16 lx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX);
             Sint16 ly = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+            // D-pad and left stick move. In a level A jumps (the joystick's up)
+            // and B or X stretches (the fire button); on titles and menus A
+            // is fire too, so it starts the game.
+            bool a = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);
+            bool bx = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_EAST) ||
+                      SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_WEST);
+            bool in_level = wide::playing();
             padj.left = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT) || lx < -dead;
             padj.right = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT) || lx > dead;
-            padj.up = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP) || ly < -dead;
+            padj.up = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP) || ly < -dead || (a && in_level);
             padj.down = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN) || ly > dead;
-            padj.fire = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);
-            padj.fire2 = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_EAST);
+            padj.fire = bx || (a && !in_level);
+            padj.fire2 = false;
         }
         joy.up = keys.up || padj.up;
         joy.down = keys.down || padj.down;
@@ -432,6 +461,19 @@ int run_window()
                 if (audio)
                     SDL_PutAudioStreamData(audio, buf, n * 2 * int(sizeof(float)));
         }
+        // Fit the widescreen picture to the window's shape.
+        int pw = 0, ph = 0;
+        SDL_GetWindowSizeInPixels(win, &pw, &ph);
+        if (int want = wide_width_for(pw, ph); want != wide_w) {
+            wide_w = want;
+            if (wide_tex)
+                SDL_DestroyTexture(wide_tex);
+            wide_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, wide_w,
+                                         wide::kHeight);
+            SDL_SetTextureScaleMode(wide_tex, SDL_SCALEMODE_NEAREST);
+            wide_px.assign(size_t(wide_w) * wide::kHeight, 0);
+            wide::set_view_extra(widescreen ? (wide_w - 288) / 2 : 0);
+        }
         // Where we are between the last game tick and the next (0..1).
         float alpha = 1.0f - float(int64_t(next - now)) / float(frame_ns);
         alpha = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
@@ -439,11 +481,13 @@ int run_window()
             bool show_message = message && now < message_until;
             if (!show_message)
                 message = nullptr;
-            showing_wide = widescreen && wide::render(wide_px.data(), kWideW, alpha, smooth);
+            // Always the full redraw (it matches the game's own picture), moved
+            // between ticks only with smoothing on.
+            showing_wide = widescreen && wide::render(wide_px.data(), wide_w, smooth ? alpha : 1.0f, true);
             if (showing_wide) {
                 if (show_message)
-                    draw_message(wide_px.data(), kWideW, wide::kHeight, message);
-                SDL_UpdateTexture(wide_tex, nullptr, wide_px.data(), kWideW * 4);
+                    draw_message(wide_px.data(), wide_w, wide::kHeight, message);
+                SDL_UpdateTexture(wide_tex, nullptr, wide_px.data(), wide_w * 4);
             } else {
                 for (int y = 0; y < kViewH; y++)
                     std::memcpy(&present[size_t(y) * kViewW], &framebuffer[(kViewY + y) * kFbW + kViewX], kViewW * 4);
@@ -453,7 +497,7 @@ int run_window()
             }
         }
         // Widescreen play fills a 16:9 window; everything else keeps the 4:3 picture.
-        SDL_SetRenderLogicalPresentation(ren, showing_wide ? kWideW : kViewW, showing_wide ? wide::kHeight : kViewH,
+        SDL_SetRenderLogicalPresentation(ren, showing_wide ? wide_w : kViewW, showing_wide ? wide::kHeight : kViewH,
                                          SDL_LOGICAL_PRESENTATION_LETTERBOX);
         SDL_RenderClear(ren);
         SDL_RenderTexture(ren, showing_wide ? wide_tex : tex, nullptr, nullptr);
@@ -477,6 +521,7 @@ int main(int argc, char **argv)
     bool cheat = false;
     std::string load_from, save_to;
     int save_frame = -1;
+    bool fullscreen = std::getenv("JP2_FULLSCREEN") != nullptr;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--adf") && i + 1 < argc) {
             adf = argv[++i];
@@ -497,6 +542,8 @@ int main(int argc, char **argv)
             record_dir = argv[++i];
         } else if (!std::strcmp(argv[i], "--cheat")) {
             cheat = true;
+        } else if (!std::strcmp(argv[i], "--fullscreen")) {
+            fullscreen = true;
         } else if (!std::strcmp(argv[i], "--trace") && i + 1 < argc) {
             const char *v = argv[++i];
             if (const char *colon = std::strchr(v, ':'))
@@ -555,5 +602,5 @@ int main(int argc, char **argv)
         game::enable_cheat();
     if (headless)
         return run_headless(headless, shots, script, load_from, save_frame, save_to);
-    return run_window();
+    return run_window(fullscreen, load_from);
 }

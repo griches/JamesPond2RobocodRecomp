@@ -5,6 +5,10 @@
 #pragma once
 #include <cstdint>
 
+namespace amiga {
+class StateIO;
+}
+
 namespace wide {
 
 constexpr int kHeight = 208;          // the gameplay window
@@ -19,6 +23,9 @@ void frame_done();                     // after each emulated frame
 // that test whether they are on screen use it (0 = the original game).
 void set_view_extra(int pixels);
 int view_extra();
+// The same, split for a camera at cam_x: near the level's ends the wide view
+// stops at the edge, so it reaches further on the other side.
+void view_extents(int cam_x, int *left, int *right);
 
 // Draws the frame just shown at `width` (>= 288). Returns false outside
 // play, when the normal picture should be used. With `full`, everything is
@@ -26,6 +33,12 @@ int view_extra();
 // between the previous tick and this one; otherwise the middle is the game's
 // own picture.
 bool render(uint32_t *out, int width, float alpha = 1.0f, bool full = false);
+
+// The renderer's memory of the parallax layer, kept in quick saves.
+void save_state(amiga::StateIO &s);
+
+// True while the game is showing a level (not titles, maps or menus).
+bool playing();
 
 // Development check: how far the redrawn middle strays from the real picture.
 void self_check();

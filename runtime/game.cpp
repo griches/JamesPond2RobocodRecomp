@@ -53,7 +53,9 @@ static bool creature_in_wide_view()
     bool x_ok = dx < 0 ? int16_t(uint16_t(-dx - w)) < 0 : int16_t(uint16_t(dx - 0x130)) <= 0;
     if (x_ok)
         return false;   // the game's own answer stands
-    bool x_wide = dx < 0 ? (-dx - w) < extra : (dx - 0x130) <= extra;
+    int left, right;
+    wide::view_extents(cx, &left, &right);
+    bool x_wide = dx < 0 ? (-dx - w) < left : (dx - 0x130) <= right;
     if (!x_wide)
         return false;
     int dy = int16_t(uint16_t(y - cy));
@@ -91,7 +93,9 @@ static bool object_in_wide_view()
     if (x_ok)
         return false;
     int xi = int16_t(x), wi = int16_t(w), cxi = int16_t(cx);
-    if (xi > cxi + 0x130 + extra || xi + wi < cxi - extra)
+    int left, right;
+    wide::view_extents(cxi, &left, &right);
+    if (xi > cxi + 0x130 + right || xi + wi < cxi - left)
         return false;
     uint16_t y2 = uint16_t(y + h);
     if (y > uint16_t(cy + 0xD0) || y2 < cy)

@@ -2,17 +2,18 @@
 
 #include "amiga.h"
 #include "disk.h"
+#include "wide.h"
 
 namespace amiga {
 
-uint32_t loading_version = 2;   // kVersion, set again after every load
+uint32_t loading_version = 3;   // kVersion, set again after every load
 
 namespace {
 
 constexpr char kMagic[8] = {'J', 'P', '2', 'S', 'T', 'A', 'T', 'E'};
 // 1: CPU registers in the recompiled backend's own layout. 2: one layout for
-// both CPU backends.
-constexpr uint32_t kVersion = 2;
+// both CPU backends. 3: adds the widescreen renderer's parallax history.
+constexpr uint32_t kVersion = 3;
 
 // Which game the save belongs to: the main program as unpacked from the disk.
 uint32_t game_id()
@@ -32,6 +33,8 @@ void machine(StateIO &s)
     paula_state(s);
     cia_state(s);
     cpu_state(s);
+    if (!s.loading() || loading_version >= 3)
+        wide::save_state(s);
 }
 
 } // namespace

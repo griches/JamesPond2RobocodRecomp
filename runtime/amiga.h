@@ -48,7 +48,9 @@ inline void touch(uint32_t a)
 void loaded(uint32_t addr, uint32_t bytes);   // bulk write (disk loads)
 extern uint32_t framebuffer[kFbW * kFbH];   // 0xAARRGGBB
 extern uint8_t index_buffer[kFbW * kFbH];   // raw bitplane colour index per pixel (0 in the border)
-extern uint8_t sprite_buffer[kFbW * kFbH];  // sprite colour (16-31) where a sprite is shown, else 0
+// Sprite colour (16-31) where a sprite is shown, else 0; bit 7 set when the
+// sprite's segment starts in a HUD band (the score and lives).
+extern uint8_t sprite_buffer[kFbW * kFbH];
 
 // What the display used, kept for renderers that redraw the picture: the
 // colour registers at the end of every line, and the bitplane pointers and

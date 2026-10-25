@@ -41,6 +41,7 @@ static Sprite spr[8];
 constexpr int kSpriteDmaFirstLine = 25;
 static uint8_t spr_index[kLineX];  // 0 = none, else colour 16..31
 static uint8_t spr_pair[kLineX];   // which sprite pair drew it
+static uint8_t spr_hud[kLineX];    // 0x80 if that sprite's segment starts in a HUD band
 
 static inline uint32_t rgb12(uint16_t c)
 {
@@ -117,6 +118,7 @@ static void sprite_dma(int line)
 static void build_sprite_line()
 {
     std::memset(spr_index, 0, sizeof spr_index);
+    std::memset(spr_hud, 0, sizeof spr_hud);
     // Lower numbered sprites win, so draw from 7 down to 0.
     for (int n = 7; n >= 0; n--) {
         Sprite &s = spr[n];
@@ -126,6 +128,9 @@ static void build_sprite_line()
         bool attached = (n & 1) && (s.ctl & 0x80);
         if ((n & 1) == 0 && (spr[n + 1].ctl & 0x80) && spr[n + 1].armed)
             continue;   // drawn together with its odd partner
+        // The score and lives are sprite segments that start in fixed bands
+        // near the top and bottom; objects use segments in between.
+        uint8_t hud = (s.vstart() < 0x40 || s.vstart() >= 0xD8) ? 0x80 : 0;
         int x0 = s.hstart() + 1;
         for (int i = 0; i < 16; i++) {
             int x = x0 + i;
@@ -143,10 +148,12 @@ static void build_sprite_line()
                 if (c) {
                     spr_index[x] = uint8_t(16 + c);
                     spr_pair[x] = uint8_t(pair);
+                    spr_hud[x] = hud;
                 }
             } else if (v) {
                 spr_index[x] = uint8_t(16 + pair * 4 + v);
                 spr_pair[x] = uint8_t(pair);
+                spr_hud[x] = hud;
             }
         }
     }
@@ -338,7 +345,7 @@ static void draw_span(int x0, int x1)
                 int prio = owner == 1 ? pf1p : pf2p;
                 if (owner == 0 || pair < prio) {
                     out = rgb12(col[s]);
-                    shown_sprite = s;
+                    shown_sprite = s | spr_hud[x];
                 }
             }
         }
