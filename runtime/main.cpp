@@ -249,9 +249,20 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
     for (int f = 1; f <= frames; f++) {
         apply_script(script, f);
         trace::frame_begin(f);
+        uint64_t t0 = SDL_GetTicksNS();
         run_frame();
         trace::frame_end();
+        uint64_t t1 = SDL_GetTicksNS();
         wide::frame_done();
+        if (std::getenv("JP2_FRAMETIME")) {
+            // What one tick costs: the game, then the widescreen redraw the app does.
+            static std::vector<uint32_t> px(size_t(kWideW) * wide::kHeight);
+            uint64_t t2 = SDL_GetTicksNS();
+            wide::render(px.data(), kWideW, 0.5f, true);
+            uint64_t t3 = SDL_GetTicksNS();
+            std::printf("frametime %d: game %.2f ms  bookkeeping %.2f ms  redraw %.2f ms\n", f, (t1 - t0) / 1e6,
+                        (t2 - t1) / 1e6, (t3 - t2) / 1e6);
+        }
         if (std::getenv("JP2_WIDECHECK"))
             wide::self_check();
         if (std::getenv("JP2_FLICKER"))

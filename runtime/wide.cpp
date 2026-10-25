@@ -3,6 +3,7 @@
 #include "amiga.h"
 #include "state.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -58,7 +59,10 @@ const Params &cam_src() { return hist[cam_lag]; }
 // The parallax layer may be double-buffered (two bitplane-5 buffers used in
 // turn), so take the blit that went into the buffer on screen: from two
 // frames back if it did, else three, else one. None: the buffer on screen
-// wasn't blitted lately (see Found).
+// wasn't blitted lately: the last blit into it from before the history
+// (the game stops blitting while the layer stands still), else see Found.
+Params last_into[2];
+int last_into_next;
 const Params *blit_for_shown()
 {
     uint32_t shown = playfield_start.bpl[4];
@@ -67,6 +71,9 @@ const Params *blit_for_shown()
         if (p.par && (p.par_d == shown || p.par_d + 2 == shown))
             return &p;
     }
+    for (const Params &p : last_into)
+        if (p.par && (p.par_d == shown || p.par_d + 2 == shown))
+            return &p;
     return nullptr;
 }
 const Params &obj_src() { return hist[obj_lag]; }
@@ -120,6 +127,9 @@ struct Found {
 };
 Found found[4];
 int found_next, frames_seen;
+// Where the layer was last placed (no scroll delay), to search near first.
+int hint_x, hint_y;
+bool hint_ok;
 
 void forget_found()
 {
@@ -157,18 +167,29 @@ bool recover_parallax(int h0, int v0, int w, int delay, Found *f)
     int n = int(pts.size());
     if (set < n / 20 || set > n * 19 / 20)
         return false;   // too empty or too full to place reliably
+    // Rarer bits first: a wrong position fails on them soonest.
+    bool rare = set * 2 < n;
+    std::stable_partition(pts.begin(), pts.end(), [&](const Pt &p) { return p.bit == int(rare); });
+    auto fits = [&](int px, int py) {
+        int bad = 0;
+        for (int i = 0; i < n; i++)
+            if (parallax_bit(px + pts[i].x, py + pts[i].y) != pts[i].bit && ++bad > n / 50)
+                return false;
+        f->base_x = px + delay;
+        f->y0 = py;
+        return true;
+    };
+    // The layer moves a few pixels a frame, so look near where it was first.
+    if (hint_ok)
+        for (int r = 0; r <= 32; r++)
+            for (int dy = -r; dy <= r; dy++)
+                for (int dx = -r; dx <= r; dx += (std::abs(dy) == r ? 1 : 2 * r))
+                    if (fits((hint_x - delay + dx) & 511, (hint_y + dy) & 255))
+                        return true;
     for (int py = 0; py < 256; py++)
-        for (int px = 0; px < 512; px++) {
-            int bad = 0, i = 0;
-            for (; i < n; i++)
-                if (parallax_bit(px + pts[i].x, py + pts[i].y) != pts[i].bit && ++bad > n / 50)
-                    break;
-            if (i == n) {
-                f->base_x = px + delay;
-                f->y0 = py;
+        for (int px = 0; px < 512; px++)
+            if (fits(px, py))
                 return true;
-            }
-        }
     return false;
 }
 
@@ -206,9 +227,8 @@ bool geometry(Geometry *g)
         g->par_known = true;
         // A blit position carried over (from before a save, or another room)
         // can be stale: trust it only while it matches what is on screen.
-        if (layer_matches(g->h0, g->v0, g->w, g->par_x0, g->par_y0))
-            return true;
-        pp = nullptr;
+        if (!layer_matches(g->h0, g->v0, g->w, g->par_x0, g->par_y0))
+            pp = nullptr;
     }
     if (!pp) {
         Found &f = found_for(ps.bpl[4]);
@@ -223,7 +243,11 @@ bool geometry(Geometry *g)
         g->par_x0 = f.valid ? f.base_x - delay : 0;
         g->par_y0 = f.valid ? f.y0 : 0;
         g->par_known = f.valid;
-        return true;
+    }
+    if (g->par_known) {
+        hint_x = g->par_x0 + delay;
+        hint_y = g->par_y0;
+        hint_ok = true;
     }
     return true;
 }
@@ -459,8 +483,12 @@ void save_state(amiga::StateIO &s)
         s.io(p->par_d);
         s.io(p->par_shift);
     }
-    if (s.loading())
+    if (s.loading()) {
         forget_found();
+        for (Params &p : last_into)
+            p = Params{};
+        hint_ok = false;
+    }
 }
 
 static int extra_px;
@@ -495,6 +523,20 @@ void frame_done()
         building.par_a = hist[0].par_a;
         building.par_d = hist[0].par_d;
         building.par_shift = hist[0].par_shift;
+    }
+    // A blit leaving the history is the last word on its buffer until the
+    // next one.
+    if (const Params &old = hist[kHist - 1]; old.par) {
+        Params *slot = &last_into[last_into_next];
+        for (Params &p : last_into)
+            if (p.par && p.par_d == old.par_d)
+                slot = &p;
+        if (slot == &last_into[last_into_next])
+            last_into_next ^= 1;
+        slot->par = true;
+        slot->par_a = old.par_a;
+        slot->par_d = old.par_d;
+        slot->par_shift = old.par_shift;
     }
     for (int k = kHist - 1; k > 0; k--)
         hist[k] = hist[k - 1];
