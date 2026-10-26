@@ -879,8 +879,10 @@ bool render(uint32_t *out, int width, float alpha, bool full)
             else
                 dst[x] = src[x - extra];
         }
+        // JP2_NO_HUD (pictures for artwork): the score and lives left out.
+        static const bool no_hud = std::getenv("JP2_NO_HUD") != nullptr;
         int shift = (g.v0 + y) < 0x80 ? extra : -extra;
-        for (int wx = 0; wx < g.w; wx++) {
+        for (int wx = 0; wx < g.w && !no_hud; wx++) {
             if (!(sp[wx] & 0x80))
                 continue;
             int x = extra + wx + shift;
