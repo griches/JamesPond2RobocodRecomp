@@ -182,15 +182,44 @@ bool boot(const char *adf_path, std::string *error)
     write32(0x208, kExtBase);
     write32(0x20C, kExtSize);
 
+    // Another release or crack must have the same code where the hooks go:
+    // the loader's are needed to run at all, the drawing ones for widescreen.
+    struct Site {
+        uint32_t pc;
+        uint8_t bytes[6];
+        bool needed;
+    };
+    static const Site sites[] = {
+        {kReadSectors, {0x4D, 0xF9, 0x00, 0xDF, 0xF0, 0x00}, true},
+        {kLoadPacked, {0x23, 0xC8, 0x00, 0x01, 0x75, 0x8E}, true},
+        {kLoadRaw, {0x23, 0xC8, 0x00, 0x01, 0x75, 0x8E}, true},
+        {kMakeDrawRecord, {0x2C, 0x78, 0x14, 0x1A, 0xBD, 0xFC}, false},
+        {kMakeTileRecord, {0x2C, 0x78, 0x14, 0x1A, 0xBD, 0xFC}, false},
+        {kMakeDrawRecord2, {0x2C, 0x78, 0x14, 0x1A, 0xBD, 0xFC}, false},
+        {kObjectInView, {0x20, 0x28, 0x00, 0x1A, 0x67, 0x3A}, false},
+        {kCreatureInView, {0x38, 0x38, 0x0A, 0xA4, 0x02, 0x44}, false},
+    };
+    bool drawing_ok = true;
+    for (const Site &s : sites) {
+        if (std::memcmp(&ram[s.pc], s.bytes, sizeof s.bytes) == 0)
+            continue;
+        if (s.needed) {
+            *error = "this release of James Pond 2 has a different loader; it isn't supported yet";
+            return false;
+        }
+        drawing_ok = false;
+    }
+    wide::set_available(drawing_ok);
+
     cpu_set_hook_handler(hook);
     cpu_set_hook(kReadSectors, true);
     cpu_set_hook(kLoadPacked, true);
     cpu_set_hook(kLoadRaw, true);
-    cpu_set_hook(kMakeDrawRecord, true);
-    cpu_set_hook(kMakeTileRecord, true);
-    cpu_set_hook(kMakeDrawRecord2, true);
-    cpu_set_hook(kObjectInView, true);
-    cpu_set_hook(kCreatureInView, true);
+    cpu_set_hook(kMakeDrawRecord, drawing_ok);
+    cpu_set_hook(kMakeTileRecord, drawing_ok);
+    cpu_set_hook(kMakeDrawRecord2, drawing_ok);
+    cpu_set_hook(kObjectInView, drawing_ok);
+    cpu_set_hook(kCreatureInView, drawing_ok);
     cpu_reset(disk::kEntry, 0x300);
     return true;
 }

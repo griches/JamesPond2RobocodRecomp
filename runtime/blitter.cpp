@@ -8,6 +8,7 @@
 namespace amiga {
 
 extern bool blitter_zero;
+uint32_t blit_keep;
 
 static inline uint16_t &R(uint32_t off) { return regs[off >> 1]; }
 
@@ -97,7 +98,8 @@ static void area_blit()
             if (d)
                 zero = false;
             if (useD) {
-                chip16_write(dpt, d);
+                if (dpt != blit_keep)
+                    chip16_write(dpt, d);
                 dpt += inc;
             }
             mask = 0xFFFF;
@@ -178,11 +180,13 @@ void blitter_start()
 {
     if (trace::on())
         trace::blit(beam_line(), cpu_instruction_pc());
+    blit_keep = 0;
     wide::blit_seen();
     if (R(0x042) & 1)
         line_blit();
     else
         area_blit();
+    blit_keep = 0;
     request_irq(INT_BLIT);
 }
 

@@ -22,6 +22,9 @@ void frame_done();                     // after each emulated frame
 // How many pixels the view reaches past the game's own on each side. Objects
 // that test whether they are on screen use it (0 = the original game).
 void set_view_extra(int pixels);
+// Off when the disk's drawing code isn't the code the hooks were made for:
+// then there is no redraw, and the game shows in 4:3.
+void set_available(bool on);
 int view_extra();
 // The same, split for a camera at cam_x: near the level's ends the wide view
 // stops at the edge, so it reaches further on the other side.
@@ -36,12 +39,15 @@ bool render(uint32_t *out, int width, float alpha = 1.0f, bool full = false);
 
 // The renderer's memory of the parallax layer, kept in quick saves.
 void save_state(amiga::StateIO &s);
+void repair_parallax();   // mend the parallax image's last word after a load
 
 // True while the game is showing a level (not titles, maps or menus).
 bool playing();
+int bursts();   // enemies that have burst into a star so far (a running count)
 
 // Development check: how far the redrawn middle strays from the real picture.
 void self_check();
 void flicker_check();
+void diff_png(const char *path);   // tests: the game's window, the redraw and their difference
 
 } // namespace wide

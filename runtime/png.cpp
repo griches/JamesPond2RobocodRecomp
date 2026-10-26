@@ -1,6 +1,7 @@
 // Minimal PNG writer (uncompressed deflate blocks) for test screenshots.
 #include "png.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -83,7 +84,11 @@ bool write_png(const char *path, const uint32_t *argb, int w, int h, int stride)
     FILE *f = std::fopen(path, "wb");
     if (!f)
         return false;
-    std::fwrite(out.data(), 1, out.size(), f);
-    std::fclose(f);
-    return true;
+    // In pieces: the PlayStation 5's file system took only the first 4 MB of
+    // one 25 MB write.
+    bool ok = true;
+    for (size_t at = 0; ok && at < out.size(); at += 1 << 20)
+        ok = std::fwrite(out.data() + at, 1, std::min<size_t>(1 << 20, out.size() - at), f) ==
+             std::min<size_t>(1 << 20, out.size() - at);
+    return std::fclose(f) == 0 && ok;
 }

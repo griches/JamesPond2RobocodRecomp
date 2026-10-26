@@ -15,7 +15,11 @@ namespace menu {
 
 enum class Action { up, down, left, right, confirm, back, prev_page, next_page, close };
 
-enum class Cmd { none, resume, quit_to_title, exit_game, load, save, skip_exit, invincible, infinite_lives, wings };
+enum class Cmd {
+    none, resume, quit_to_title, exit_game, load, save, skip_exit, invincible, infinite_lives, wings,
+    continue_game, start_fresh,   // the question at launch
+    play_section,                 // arg: the game's section number
+};
 struct Request {
     Cmd cmd = Cmd::none;
     int arg = 0;
@@ -36,6 +40,7 @@ struct View {
     bool invincible = false, infinite_lives = false, wings = false;
     uint32_t score = 0;
     int lives = 0, energy = 0;
+    int section = -1;                 // the level being played (the game's section number), or -1
     float level_l = 0, level_r = 0;   // the sound preview's loudness, 0..1
     bool pad = true;                  // the last input came from a gamepad: show its buttons
     glyphs::Style style = glyphs::Style::xbox;
@@ -43,6 +48,9 @@ struct View {
 };
 
 void open();
+// At launch, after the game was quit mid-level: carry on from there?
+void open_continue(SDL_Texture *thumb, const std::string &when);
+bool asking_continue();
 bool is_open();
 void close();
 Request input(Action a, const View &v);

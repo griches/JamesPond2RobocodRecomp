@@ -240,6 +240,9 @@ static bool silent_block(uint32_t lc, uint16_t len)
     return true;
 }
 
+static SampleStart start_listener;
+void paula_on_start(SampleStart fn) { start_listener = fn; }
+
 // JP2_AUDIOLOG=1: each channel's starts, loops, stops and volume changes, by time.
 static const bool audio_log = std::getenv("JP2_AUDIOLOG") != nullptr;
 static long lines_run;
@@ -287,6 +290,8 @@ void paula_dma_changed(uint16_t old_dmacon, uint16_t new_dmacon)
                         now ? "START" : "stop ", c.lc, c.len, c.per, c.vol, now ? 0 : c.words_left, cpu_reg(PC));
         if (now && !was) {
             ringing[n].on = false;
+            if (start_listener)
+                start_listener(n, c.lc, c.len);
             c.running = true;
             starting = true;
             start_block(n);

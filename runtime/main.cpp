@@ -5,8 +5,11 @@
 // --headless runs N frames with no window or sound, for tests. --input plays
 // joystick/key presses inside the program (no keystrokes go to the OS):
 //   "120-130:fire,300-400:right+fire,500:key=F1"
+// and, for tests, writes and reads of game memory (hex):
+//   "300:poke=2552=0001,900:peek=251a+2284"
 #include "amiga.h"
 #include "cpu.h"
+#include "disk.h"
 #include "game.h"
 #include "glyphs.h"
 #include "menu.h"
@@ -14,12 +17,16 @@
 #include "png.h"
 #include "record.h"
 #include "settings.h"
+#include "setup.h"
 #include "state.h"
 #include "trace.h"
 #include "ui.h"
 #include "wide.h"
 
 #include <SDL3/SDL.h>
+#ifdef _WIN32
+#include <SDL3/SDL_main.h>   // WinMain for a windowed program, no console
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -46,11 +53,15 @@ struct Shot {
 };
 
 constexpr int kWideW = 368;   // 16:9 at the 208-line gameplay window
+constexpr int kGameW = 288;   // the game's own window: what widescreen off shows
 
 struct Press {
     int from, to;
     Joystick joy;
     int key;   // -1 for none
+    uint32_t poke_addr = 0, poke_value = 0;
+    int poke_size = 0;              // bytes; 0 for none
+    std::vector<uint32_t> peeks;    // words to print at `from`
 };
 
 // Amiga raw key code for a name: a letter, a digit, F1-F10, or a few others.
@@ -96,6 +107,36 @@ std::vector<Press> parse_input(const char *spec)
         Press p{};
         p.key = -1;
         std::string range = item.substr(0, colon), what = item.substr(colon + 1);
+        if (what.rfind("peek=", 0) == 0) {   // "F:peek=251a+2248": print those words at frame F
+            Press k{};
+            k.key = -1;
+            k.from = k.to = std::atoi(range.c_str());
+            std::string v = what.substr(5);
+            size_t q = 0;
+            while (q < v.size()) {
+                size_t plus = v.find('+', q);
+                std::string a = v.substr(q, plus == std::string::npos ? std::string::npos : plus - q);
+                k.peeks.push_back(uint32_t(std::strtoul(a.c_str(), nullptr, 16)));
+                q = plus == std::string::npos ? v.size() : plus + 1;
+            }
+            out.push_back(k);
+            continue;
+        }
+        if (what.rfind("poke=", 0) == 0) {   // "F:poke=2552=0001": hex address = hex value (2, 4 or 8 digits)
+            Press k{};
+            k.key = -1;
+            k.from = k.to = std::atoi(range.c_str());
+            std::string v = what.substr(5);
+            size_t eq = v.find('=');
+            if (eq != std::string::npos) {
+                k.poke_addr = uint32_t(std::strtoul(v.substr(0, eq).c_str(), nullptr, 16));
+                std::string val = v.substr(eq + 1);
+                k.poke_value = uint32_t(std::strtoul(val.c_str(), nullptr, 16));
+                k.poke_size = int(val.size() / 2);
+                out.push_back(k);
+            }
+            continue;
+        }
         if (what.rfind("type=", 0) == 0) {
             int at = std::atoi(range.c_str());
             std::string text = what.substr(5);
@@ -142,6 +183,20 @@ void apply_script(const std::vector<Press> &script, int frame)
         j.right |= p.joy.right;
         j.fire |= p.joy.fire;
         j.fire2 |= p.joy.fire2;
+        if (!p.peeks.empty() && frame == p.from) {
+            std::printf("peek %d:", frame);
+            for (uint32_t a : p.peeks)
+                std::printf(" %X=%04X", a, read16(a));
+            std::printf("\n");
+        }
+        if (p.poke_size && frame == p.from) {
+            if (p.poke_size == 1)
+                write8(p.poke_addr, uint8_t(p.poke_value));
+            else if (p.poke_size == 2)
+                write16(p.poke_addr, uint16_t(p.poke_value));
+            else
+                write32(p.poke_addr, p.poke_value);
+        }
         if (p.key >= 0 && frame == p.from)
             key_event(p.key, true);
         if (p.key >= 0 && frame == p.to)
@@ -247,6 +302,127 @@ int amiga_key(SDL_Scancode sc)
     return -1;
 }
 
+// The game's explosion sound (a boss going up, for one): the same sample in
+// every level. Counted as it starts, for the pad to thump with each boom.
+constexpr uint32_t kBoomSample = 0x3CC98;
+constexpr uint32_t kBoomCrc = 0x9AAE7089;   // of its first 64 bytes
+int booms_heard;
+void heard_sample(int, uint32_t lc, uint16_t)
+{
+    if ((lc & ~1u) == kBoomSample && disk::crc32(&ram[kBoomSample], 64) == kBoomCrc)
+        booms_heard++;
+}
+
+// What the pad should feel after a frame: 1 Robocod was hit (his energy
+// dropped), 2 he lost a life, 3 an explosion (the boom sound, or an enemy
+// bursting into a star, which makes no sound of its own). A boss going up
+// sets off a boom and a cluster of stars over a few frames: one thump for the
+// lot. Quiet after a load or a restart.
+struct Feel {
+    bool known = false;
+    uint16_t energy = 0, lives = 0;
+    int booms = 0, stars = 0;
+    int ticks = 0, thumped_at = -100;
+
+    int check(bool in_level)
+    {
+        uint16_t e = read16(0x2286), l = read16(0x2284);   // energy, lives
+        bool bang = booms_heard != booms || wide::bursts() != stars;
+        int what = 0;
+        ticks++;
+        if (known && in_level)
+            what = l < lives ? 2 : e < energy ? 1 : bang && ticks - thumped_at >= 4 ? 3 : 0;
+        if (what == 3)
+            thumped_at = ticks;
+        energy = e;
+        lives = l;
+        booms = booms_heard;
+        stars = wide::bursts();
+        known = in_level;
+        return what;
+    }
+
+    // How hard the game is shaking the screen now, 0..1: it counts frames
+    // down in $AAC (sideways) and $AAE (up and down) through its table of
+    // offsets at $FC0A, biggest first (a landing from a long fall, a boss).
+    float shake() const
+    {
+        int most = 0;
+        for (uint32_t counter : {0xAACu, 0xAAEu})
+            if (int n = read16(counter); n > 0 && n < 48)
+                most = std::max(most, std::abs(int(int8_t(read8(0xFC0A + uint32_t(n))))));
+        return std::min(1.0f, float(most) / 15.0f);
+    }
+};
+
+// What the pad's motors should be doing, worked out each frame and sent only
+// when it changes. SDL treats a request at the strength already running as
+// "keep going" and sends nothing, so back-to-back booms at one strength felt
+// like a single long one: each boom is now its own pulse with a gap before
+// the next (they queue up when the game sets several off at once), and the
+// shake drops away under the pulses so they stand out.
+struct Rumble {
+    static constexpr uint64_t ms = 1000000ull;
+    static constexpr uint64_t kPulse = 90 * ms, kGap = 60 * ms;   // a boom: on, then off before the next
+    uint64_t knock_until = 0;   // a hit's or a lost life's buzz
+    uint16_t knock_lo = 0, knock_hi = 0;
+    int booms_waiting = 0, booms_played = 0;
+    uint64_t boom_until = 0, boom_next = 0;
+    uint16_t sent_lo = 0, sent_hi = 0;
+    uint64_t sent_at = 0;
+
+    void felt(int what, uint64_t now)
+    {
+        if (what == 3) {
+            booms_waiting = std::min(booms_waiting + 1, 3);   // never fall far behind the explosions
+        } else if (what) {
+            knock_until = now + (what == 2 ? 420 : 170) * ms;
+            knock_lo = what == 2 ? 0xD000 : 0x7000;
+            knock_hi = what == 2 ? 0x9000 : 0xB000;
+        }
+    }
+
+    // What to send now, if anything: true with the strengths and how long
+    // they hold if not changed again (a lost frame never leaves it running).
+    // A motor strength at the player's setting: 5 as designed, each step a
+    // fifth of that, as far as the motor goes.
+    static uint16_t at_strength(uint32_t v, int strength) { return uint16_t(std::min<uint32_t>(0xFFFF, v * strength / 5)); }
+
+    bool step(bool on, float shake, int strength, uint64_t now, uint16_t &lo, uint16_t &hi, uint32_t &hold_ms)
+    {
+        lo = hi = 0;
+        if (!on) {
+            booms_waiting = 0;
+        } else if (now < knock_until) {
+            lo = knock_lo, hi = knock_hi;
+        } else {
+            if (now >= boom_until && booms_waiting && now >= boom_next) {
+                booms_waiting--;
+                booms_played++;
+                boom_until = now + kPulse;
+                boom_next = boom_until + kGap;
+            }
+            if (now < boom_until) {   // a deep thump, a hair different from the one before
+                lo = uint16_t(0xFFFF - (booms_played & 1));
+                hi = uint16_t(0x5000 + (booms_played & 1));
+            } else if (shake > 0) {
+                float s = now < boom_next || booms_waiting ? shake * 0.3f : shake;   // quiet between booms
+                lo = uint16_t(s * 0xE000);
+                hi = uint16_t(s * 0x8000);
+            }
+        }
+        lo = at_strength(lo, strength);
+        hi = at_strength(hi, strength);
+        bool changed = lo != sent_lo || hi != sent_hi;
+        bool refresh = (lo || hi) && now >= sent_at + 150 * ms;
+        if (!changed && !refresh)
+            return false;
+        sent_lo = lo, sent_hi = hi, sent_at = now;
+        hold_ms = lo || hi ? 300 : 0;
+        return true;
+    }
+};
+
 // 16-bit stereo WAV of what the speakers got.
 bool write_wav(const std::string &path, const std::vector<float> &lr)
 {
@@ -273,6 +449,17 @@ bool write_wav(const std::string &path, const std::vector<float> &lr)
 void picture_shot(const std::string &spec);
 std::vector<std::string> picture_shots;   // --picture-shot, taken after the last frame
 
+// --poke FRAME:ADDR=VALUE (hex address and value; word unless the value has
+// more than 4 digits): a memory write before that frame, for tests.
+struct Poke {
+    int frame;
+    uint32_t addr, value;
+    bool longword;
+};
+std::vector<Poke> pokes;
+std::vector<std::pair<int, int>> section_jumps;   // --section FRAME:N (hex N), for tests
+void go_to_section(int n);
+
 // The menu drawn off screen: "page,row,rows,dialog,width,height,style:file.png"
 // (style 0 Steam Deck, 1 Xbox, 2 PlayStation, 3 Nintendo, 4 keyboard).
 void menu_shot(const std::string &spec)
@@ -295,6 +482,7 @@ void menu_shot(const std::string &spec)
     v.slots[2].exists = true;
     v.slots[2].when = "Yesterday 21:05";
     v.score = 240900;
+    v.section = 0x05;
     v.lives = 3;
     v.energy = 4;
     v.level_l = 0.62f;
@@ -313,6 +501,13 @@ void menu_shot(const std::string &spec)
     SDL_DestroySurface(surf);
 }
 
+// Width of --wide-shot pictures: 16:9, or JP2_SHOT_WIDTH (up to 512).
+int shot_width()
+{
+    const char *w = std::getenv("JP2_SHOT_WIDTH");
+    return w ? std::clamp(std::atoi(w) & ~1, 288, wide::kMaxWidth) : kWideW;
+}
+
 int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<Press> &script,
                  const std::string &load_from, int save_frame, const std::string &save_to,
                  const std::string &wav_path)
@@ -326,14 +521,35 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
     }
     float peak = 0;
     int loud_frames = 0;
+    Feel feel;
     for (int f = 1; f <= frames; f++) {
         apply_script(script, f);
+        for (auto [at, n] : section_jumps) {
+            if (at == f)
+                go_to_section(n);
+            if (at + 150 == f)
+                std::printf("section %02X asked at frame %d: 150 frames on, section %02X, %s\n", n, at,
+                            read16(0x251A), wide::playing() ? "playing" : "not playing");
+        }
+        for (const Poke &p : pokes)
+            if (p.frame == f) {
+                if (p.longword)
+                    write32(p.addr, p.value);
+                else
+                    write16(p.addr, uint16_t(p.value));
+            }
         trace::frame_begin(f);
+        watch_frame = f;
         uint64_t t0 = SDL_GetTicksNS();
         run_frame();
         trace::frame_end();
         uint64_t t1 = SDL_GetTicksNS();
         wide::frame_done();
+        if (std::getenv("JP2_PARVIEW")) {   // the in-between pictures smooth motion draws, a quarter tick apart
+            static std::vector<uint32_t> px(size_t(wide::kMaxWidth) * wide::kHeight);
+            for (float a : {0.25f, 0.5f, 0.75f, 1.0f})
+                wide::render(px.data(), shot_width(), a, true);
+        }
         if (std::getenv("JP2_FRAMETIME")) {
             // What one tick costs: the game, then the widescreen redraw the app does.
             static std::vector<uint32_t> px(size_t(kWideW) * wide::kHeight);
@@ -342,6 +558,24 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
             uint64_t t3 = SDL_GetTicksNS();
             std::printf("frametime %d: game %.2f ms  bookkeeping %.2f ms  redraw %.2f ms\n", f, (t1 - t0) / 1e6,
                         (t2 - t1) / 1e6, (t3 - t2) / 1e6);
+        }
+        if (std::getenv("JP2_SHAKELOG"))
+            std::printf("shake %d: counters %d,%d  speed %08X  cam %d,%d\n", f, read16(0xAAC), read16(0xAAE),
+                        read32(0x22C4), int16_t(read16(0xAB0)), int16_t(read16(0xAB2)));
+        if (std::getenv("JP2_RUMBLELOG")) {   // what the pad would be told, on the game's clock
+            static Rumble rumble;
+            uint64_t at = uint64_t(f) * 20 * Rumble::ms;
+            if (int what = feel.check(wide::playing())) {
+                std::printf("rumble at frame %d: %s\n", f, what == 2 ? "lost a life" : what == 3 ? "explosion" : "hit");
+                rumble.felt(what, at);
+            }
+            // The window steps once per 5 ms or so; do the same between frames.
+            for (uint64_t t = at; t < at + 20 * Rumble::ms; t += 5 * Rumble::ms) {
+                uint16_t lo, hi;
+                uint32_t hold;
+                if (rumble.step(true, feel.shake(), 5, t, lo, hi, hold))
+                    std::printf("  pad at %6.3f s: %04X %04X for %u ms\n", t / 1e9, lo, hi, hold);
+            }
         }
         if (std::getenv("JP2_WIDECHECK"))
             wide::self_check();
@@ -363,9 +597,14 @@ int run_headless(int frames, const std::vector<Shot> &shots, const std::vector<P
         for (const Shot &s : shots) {
             if (s.frame != f)
                 continue;
-            static uint32_t wide_px[kWideW * wide::kHeight];
-            if (s.wide && wide::render(wide_px, kWideW, 1.0f, std::getenv("JP2_FULLSHOT") != nullptr))
-                write_png(s.path.c_str(), wide_px, kWideW, wide::kHeight, kWideW);
+            // "--shot F:name.diff.png": the game's window, the redraw and where they differ.
+            if (s.path.size() > 9 && s.path.compare(s.path.size() - 9, 9, ".diff.png") == 0) {
+                wide::diff_png(s.path.c_str());
+                continue;
+            }
+            static uint32_t wide_px[wide::kMaxWidth * wide::kHeight];
+            if (s.wide && wide::render(wide_px, shot_width(), 1.0f, std::getenv("JP2_FULLSHOT") != nullptr))
+                write_png(s.path.c_str(), wide_px, shot_width(), wide::kHeight, shot_width());
             else
                 save_view(s.path.c_str());
         }
@@ -393,6 +632,9 @@ int wide_width_for(int pw, int ph)
 }
 
 // ---- save slots ------------------------------------------------------------------
+
+// Where the game was left when it was last quit mid-level.
+std::string resume_path() { return pref_dir() + "resume.jp2s"; }
 
 std::string slot_path(int n)
 {
@@ -534,6 +776,71 @@ void cheat_key_frame()
     }
 }
 
+// ---- jumping about, unseen --------------------------------------------------------------
+
+// Runs frames with no picture or sound kept, for the moves the player
+// shouldn't watch (the story before the title, the selector).
+void run_silently(int frames, void (*each)(int frame) = nullptr)
+{
+    for (int f = 0; f < frames; f++) {
+        joy = Joystick{};
+        if (each)
+            each(f);
+        run_frame();
+        wide::frame_done();
+        cheat_key_frame();
+    }
+    joy = Joystick{};
+    float discard[4096];
+    while (audio_take(discard, 2048) > 0) {
+    }
+}
+
+// Esc does it on the Amiga; then a press of fire skips the story to the title.
+void go_to_title()
+{
+    key_event(0x45, true);
+    run_silently(216, [](int f) {
+        if (f == 3)
+            key_event(0x45, false);
+        joy.fire = f >= 195 && f < 199;
+    });
+    cheat_key = CheatKey{};
+}
+
+constexpr uint32_t kSection = 0x251A;      // word: the level (the game calls them sections, $00-$50)
+constexpr uint32_t kSelectorStart = 0x594; // word: the section its map selector starts
+
+// A new game at a section, through the game's own map selector: its M cheat
+// key, then Return to take the section it offers. That works from a level,
+// so from anywhere else start a game from the title first. Either way it is
+// a new game (score 0, three lives).
+void go_to_section(int n)
+{
+    if (!wide::playing()) {
+        go_to_title();
+        run_silently(40);
+        run_silently(8, [](int f) { joy.fire = f < 4; });
+        for (int waited = 0; waited < 600 && !wide::playing(); waited += 10)
+            run_silently(10);
+    }
+    uint16_t cheats = read16(kCheatsOn);
+    write16(kCheatsOn, 1);
+    write16(kSelectorStart, uint16_t(n));
+    write8(kLastKey, 0x37);   // M
+    // The selector replaces the level; Return takes the section it offers.
+    for (int f = 0; f < 50 && wide::playing(); f++)
+        run_silently(1);
+    for (int tries = 0; tries < 40 && !wide::playing(); tries++) {
+        key_event(0x44, true);
+        run_silently(2);
+        key_event(0x44, false);
+        run_silently(8);
+    }
+    write16(kCheatsOn, cheats);
+    set_invincible(false);   // with cheats on, Return is also the invincibility key
+}
+
 // ---- sound --------------------------------------------------------------------------------
 
 void apply_audio(const settings::Settings &s)
@@ -553,10 +860,25 @@ void apply_audio(const settings::Settings &s)
 // with scanlines over it if they are on.
 struct Presenter {
     SDL_Renderer *ren;
-    SDL_Texture *big = nullptr;   // crisp: the picture blown up by a whole number first
+    SDL_Texture *big = nullptr;   // crisp and soft: the picture blown up by a whole number first
     int big_w = 0, big_h = 0;
     SDL_Texture *lines = nullptr;
-    int lines_rows = 0, lines_strength = 0;
+    int lines_rows = 0, lines_height = 0, lines_strength = 0;
+    SDL_Texture *tall = nullptr, *crt = nullptr, *grille = nullptr;   // the CRT picture's stages
+    int tall_w = 0, tall_h = 0, crt_w = 0, crt_h = 0;
+
+    // A render target of this size, made again only when the size changes.
+    void target(SDL_Texture *&t, int &tw, int &th, int w, int h)
+    {
+        if (t && tw == w && th == h)
+            return;
+        if (t)
+            SDL_DestroyTexture(t);
+        t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, w, h);
+        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
+        tw = w;
+        th = h;
+    }
 
     void draw(SDL_Texture *src, int w, int h, int picture, int scanlines)
     {
@@ -567,19 +889,18 @@ struct Presenter {
             sc = std::max(1.0f, std::floor(sc));
         SDL_FRect dst{std::round((float(ow) - float(w) * sc) / 2), std::round((float(oh) - float(h) * sc) / 2),
                       std::round(float(w) * sc), std::round(float(h) * sc)};
+        if (picture == 3) {
+            draw_crt(src, w, h, dst, scanlines);
+            return;
+        }
+        // Crisp: each pixel becomes k x k (the next whole number up), then a
+        // smooth step down to the window: even, sharp pixels at any size.
+        // Soft: only half that first, so the smoothing blends a little.
+        int k = picture == 0 ? int(std::ceil(sc - 0.001f)) : picture == 2 ? int(std::ceil(sc / 2 - 0.001f)) : 1;
         SDL_SetTextureScaleMode(src, picture == 2 ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
-        int k = int(std::ceil(sc - 0.001f));
-        if (picture == 0 && k > 1 && float(k) != sc) {
-            // Each pixel becomes k x k, then a smooth step down to the window:
-            // even, sharp pixels at any size.
-            if (!big || big_w != w * k || big_h != h * k) {
-                if (big)
-                    SDL_DestroyTexture(big);
-                big_w = w * k;
-                big_h = h * k;
-                big = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, big_w, big_h);
-                SDL_SetTextureScaleMode(big, SDL_SCALEMODE_LINEAR);
-            }
+        if (k > 1 && float(k) != sc) {
+            SDL_SetTextureScaleMode(src, SDL_SCALEMODE_NEAREST);
+            target(big, big_w, big_h, w * k, h * k);
             SDL_SetRenderTarget(ren, big);
             SDL_RenderTexture(ren, src, nullptr, nullptr);
             SDL_SetRenderTarget(ren, nullptr);
@@ -587,51 +908,129 @@ struct Presenter {
         } else {
             SDL_RenderTexture(ren, src, nullptr, &dst);
         }
-        if (scanlines) {
-            if (!lines || lines_rows != h || lines_strength != scanlines) {
-                if (lines)
-                    SDL_DestroyTexture(lines);
-                std::vector<uint32_t> px(size_t(h) * 2);
-                uint32_t dark = uint32_t(scanlines == 1 ? 0.24 * 255 : 0.48 * 255) << 24;
-                for (int y = 0; y < h; y++) {
-                    px[size_t(y) * 2] = 0;
-                    px[size_t(y) * 2 + 1] = dark;
-                }
-                lines = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, 1, h * 2);
-                SDL_UpdateTexture(lines, nullptr, px.data(), 4);
-                SDL_SetTextureBlendMode(lines, SDL_BLENDMODE_BLEND);
-                SDL_SetTextureScaleMode(lines, SDL_SCALEMODE_LINEAR);
-                lines_rows = h;
-                lines_strength = scanlines;
-            }
-            SDL_RenderTexture(ren, lines, nullptr, &dst);
-        }
+        draw_lines(h, dst, scanlines);
     }
 
-    // The picture shrunk twice and stretched back over the whole window: a
-    // cheap frosted glass for behind the menu.
+    // Worked out for each screen row of the picture: a smooth wave, one per
+    // game row, darkest between rows. A pure wave has no finer ripples to
+    // fold into a slow beat when a game row covers a fractional number of
+    // screen rows (3.85 on a Steam Deck).
+    void draw_lines(int h, const SDL_FRect &dst, int scanlines)
+    {
+        if (!scanlines)
+            return;
+        int lh = int(dst.h);
+        if (!lines || lines_rows != h || lines_height != lh || lines_strength != scanlines) {
+            if (lines)
+                SDL_DestroyTexture(lines);
+            float peak = scanlines == 1 ? 0.26f : 0.50f;
+            std::vector<uint32_t> px(size_t(std::max(1, lh)));
+            for (int y = 0; y < lh; y++) {
+                float a = 0;
+                for (int k = 0; k < 8; k++) {   // averaged over the pixel
+                    float p = (float(y) + (float(k) + 0.5f) / 8) * float(h) / float(lh);
+                    a += 0.5f + 0.5f * std::cos(6.2831853f * (p - std::floor(p)));
+                }
+                px[size_t(y)] = uint32_t(std::lround(peak * a / 8 * 255)) << 24;
+            }
+            lines = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, 1, std::max(1, lh));
+            SDL_UpdateTexture(lines, nullptr, px.data(), 4);
+            SDL_SetTextureBlendMode(lines, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(lines, SDL_SCALEMODE_NEAREST);
+            lines_rows = h;
+            lines_height = lh;
+            lines_strength = scanlines;
+        }
+        SDL_RenderTexture(ren, lines, nullptr, &dst);
+    }
+
+    // A television of the time: each line soft along its length (the beam)
+    // but sharp between lines, a glow round bright parts, scanlines, the
+    // red-green-blue stripes of an aperture grille, and the picture on gently
+    // curved glass, darker towards its edges.
+    void draw_crt(SDL_Texture *src, int w, int h, const SDL_FRect &dst, int scanlines)
+    {
+        int cw = std::max(1, int(dst.w)), ch = std::max(1, int(dst.h));
+        // Rows stretched by a whole number with no smoothing, then smoothed to
+        // the screen: the smoothing is then (almost) only along the lines.
+        int k = std::max(1, int(std::ceil(dst.h / float(h) - 0.001f)));
+        SDL_SetTextureScaleMode(src, SDL_SCALEMODE_NEAREST);
+        target(tall, tall_w, tall_h, w, h * k);
+        SDL_SetRenderTarget(ren, tall);
+        SDL_RenderTexture(ren, src, nullptr, nullptr);
+        target(crt, crt_w, crt_h, cw, ch);
+        SDL_SetRenderTarget(ren, crt);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_RenderTexture(ren, tall, nullptr, nullptr);
+        // The glow: the picture lightly blurred and added round bright parts
+        // (faintly: adding more would push full colours out of their hue).
+        SDL_Texture *blur = shrink(src, w, h, 1);
+        SDL_SetTextureBlendMode(blur, SDL_BLENDMODE_ADD);
+        SDL_SetTextureAlphaModFloat(blur, 0.13f);
+        SDL_RenderTexture(ren, blur, nullptr, nullptr);
+        SDL_SetTextureBlendMode(blur, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureAlphaModFloat(blur, 1);
+        SDL_FRect all{0, 0, float(cw), float(ch)};
+        draw_lines(h, all, std::max(scanlines, 1));
+        // The grille: three screen columns, each holding back the other two colours a little.
+        if (!grille) {
+            const uint32_t stripes[3] = {0xFFFFE2E2u, 0xFFE2FFE2u, 0xFFE2E2FFu};
+            grille = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, 3, 1);
+            SDL_UpdateTexture(grille, nullptr, stripes, 12);
+            SDL_SetTextureBlendMode(grille, SDL_BLENDMODE_MOD);
+            SDL_SetTextureScaleMode(grille, SDL_SCALEMODE_NEAREST);
+        }
+        SDL_RenderTextureTiled(ren, grille, nullptr, 1.0f, &all);
+        SDL_SetRenderTarget(ren, nullptr);
+        // The glass: the picture on a gently bulging mesh, its edges bowed
+        // and its corners darker.
+        constexpr int nx = 32, ny = 20;
+        constexpr float bend = 0.035f;
+        std::vector<SDL_Vertex> v;
+        std::vector<int> idx;
+        float cx = dst.x + dst.w / 2, cy = dst.y + dst.h / 2;
+        for (int j = 0; j <= ny; j++)
+            for (int i = 0; i <= nx; i++) {
+                float u = float(i) / nx, t = float(j) / ny, x = u * 2 - 1, y = t * 2 - 1;
+                float px = x * (1 - bend * y * y), py = y * (1 - bend * x * x);
+                float shade = (1 - 0.14f * x * x * x * x) * (1 - 0.18f * y * y * y * y);
+                v.push_back({{cx + px * dst.w / 2, cy + py * dst.h / 2}, {shade, shade, shade, 1}, {u, t}});
+            }
+        for (int j = 0; j < ny; j++)
+            for (int i = 0; i < nx; i++) {
+                int a = j * (nx + 1) + i, b = a + 1, c = a + nx + 1, d = c + 1;
+                for (int q : {a, b, d, a, d, c})
+                    idx.push_back(q);
+            }
+        SDL_RenderGeometry(ren, crt, v.data(), int(v.size()), idx.data(), int(idx.size()));
+    }
+
+    // The picture shrunk (once a light blur, for the CRT's glow; twice a
+    // heavy one, for the frosted glass behind the menu).
     SDL_Texture *small[2] = {};
     int small_w[2] = {}, small_h[2] = {};
-    void draw_frosted(SDL_Texture *src, int w, int h, float alpha)
+    SDL_Texture *shrink(SDL_Texture *src, int w, int h, int steps = 2)
     {
         const int div[2] = {4, 12};
         SDL_Texture *from = src;
+        SDL_Texture *was = SDL_GetRenderTarget(ren);
         SDL_SetTextureScaleMode(src, SDL_SCALEMODE_LINEAR);
-        for (int i = 0; i < 2; i++) {
-            int sw = std::max(2, w / div[i]), sh = std::max(2, h / div[i]);
-            if (!small[i] || small_w[i] != sw || small_h[i] != sh) {
-                if (small[i])
-                    SDL_DestroyTexture(small[i]);
-                small[i] = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, sw, sh);
-                SDL_SetTextureScaleMode(small[i], SDL_SCALEMODE_LINEAR);
-                small_w[i] = sw;
-                small_h[i] = sh;
-            }
+        for (int i = 0; i < steps; i++) {
+            target(small[i], small_w[i], small_h[i], std::max(2, w / div[i]), std::max(2, h / div[i]));
             SDL_SetRenderTarget(ren, small[i]);
             SDL_RenderTexture(ren, from, nullptr, nullptr);
             from = small[i];
         }
-        SDL_SetRenderTarget(ren, nullptr);
+        SDL_SetRenderTarget(ren, was);
+        return from;
+    }
+
+    // The picture blurred and stretched over the whole window: a cheap
+    // frosted glass for behind the menu.
+    void draw_frosted(SDL_Texture *src, int w, int h, float alpha)
+    {
+        SDL_Texture *from = shrink(src, w, h);
         int ow = 0, oh = 0;
         SDL_GetRenderOutputSize(ren, &ow, &oh);
         float sc = std::max(float(ow) / float(w), float(oh) / float(h)) * 1.06f;   // cover, edges off screen
@@ -639,6 +1038,7 @@ struct Presenter {
                       float(h) * sc};
         SDL_SetTextureAlphaModFloat(from, alpha);
         SDL_RenderTexture(ren, from, nullptr, &dst);
+        SDL_SetTextureAlphaModFloat(from, 1);
     }
 };
 
@@ -668,22 +1068,27 @@ glyphs::Style pad_style(SDL_Gamepad *pad)
         default: break;
         }
     }
+#ifdef __PROSPERO__
+    (void)deck;
+    return glyphs::Style::playstation;
+#else
     return deck ? glyphs::Style::deck : glyphs::Style::xbox;
+#endif
 }
 
 // The last frame through the Picture setting, off screen:
-// "picture,scanlines,width,height:file.png".
+// "picture,scanlines,width,height[,widescreen]:file.png".
 void picture_shot(const std::string &spec)
 {
     size_t colon = spec.find(':');
     if (colon == std::string::npos)
         return;
-    int picture = 0, scan = 0, w = 1280, h = 800;
-    std::sscanf(spec.c_str(), "%d,%d,%d,%d", &picture, &scan, &w, &h);
+    int picture = 0, scan = 0, w = 1280, h = 800, widescreen = 1;
+    std::sscanf(spec.c_str(), "%d,%d,%d,%d,%d", &picture, &scan, &w, &h, &widescreen);
     SDL_Surface *surf = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ARGB8888);
     SDL_Renderer *ren = SDL_CreateSoftwareRenderer(surf);
-    int ww = wide_width_for(w, h);
-    wide::set_view_extra((ww - 288) / 2);
+    int ww = widescreen ? wide_width_for(w, h) : kGameW;
+    wide::set_view_extra((ww - kGameW) / 2);
     std::vector<uint32_t> px(size_t(ww) * wide::kHeight);
     wide::render(px.data(), ww, 1.0f, true);
     SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, ww, wide::kHeight);
@@ -724,7 +1129,23 @@ std::vector<ScriptStep> parse_script(const char *spec)
     return out;
 }
 
-int run_window(bool force_fullscreen, const std::string &load_from)
+// The player's disk, as saved by the first-run page.
+std::string stored_disk_path() { return pref_dir().empty() ? std::string() : pref_dir() + "disk.adf"; }
+
+// Boots from a disk the player chose and keeps it (as a plain .adf) in the
+// game's own folder for next time.
+bool boot_and_keep(const std::string &path, std::string *error)
+{
+    if (!game::boot(path.c_str(), error))
+        return false;
+    std::string store = stored_disk_path();
+    if (!store.empty() && path != store && !disk::save_image(store))
+        std::fprintf(stderr, "couldn't keep the disk at %s\n", store.c_str());
+    return true;
+}
+
+int run_window(bool force_fullscreen, const std::string &load_from, const std::vector<std::string> &disks,
+               void (*after_boot)())
 {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -735,7 +1156,10 @@ int run_window(bool force_fullscreen, const std::string &load_from)
         set.fullscreen = true;
     settings::Settings applied = set, written = set;
 
-    SDL_Window *win = SDL_CreateWindow("James Pond 2 - Codename RoboCod", kViewW * 3, kViewH * 3,
+    int win_w = kViewW * 3, win_h = kViewH * 3;
+    if (const char *ws = std::getenv("JP2_WINDOW"))   // tests and screenshots: "1920x1080"
+        std::sscanf(ws, "%dx%d", &win_w, &win_h);
+    SDL_Window *win = SDL_CreateWindow("James Pond 2 - Codename RoboCod", win_w, win_h,
                                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!win) {
         std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
@@ -751,10 +1175,43 @@ int run_window(bool force_fullscreen, const std::string &load_from)
     SDL_SetRenderVSync(ren, 1);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     ui::init(ren);
+
+    // The disk: the first that boots, else ask for one.
+    bool booted = false;
+    std::string why;
+    for (const std::string &d : disks) {
+        std::string err;
+        SDL_PathInfo info;
+        if (d.empty() || !SDL_GetPathInfo(d.c_str(), &info))
+            continue;
+        if (game::boot(d.c_str(), &err)) {
+            std::fprintf(stderr, "disk: booted from %s, %.2f s after start\n", d.c_str(), SDL_GetTicks() / 1000.0);
+            booted = true;
+            break;
+        }
+        if (why.empty())
+            why = d + ": " + err;
+    }
+    if (!booted) {
+        std::string dir = pref_dir();
+        if (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\'))
+            dir.pop_back();
+        if (setup::run(win, ren, boot_and_keep, why, pad_style(nullptr), dir).empty()) {
+            SDL_Quit();
+            return 0;
+        }
+    }
+    if (after_boot)
+        after_boot();
     Presenter presenter{ren};
     SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kViewW, kViewH);
     int wide_w = 0;
     SDL_Texture *wide_tex = nullptr;
+    // With widescreen off, gameplay still comes from the redraw (so smooth
+    // motion works), at the game's own width and the same height.
+    SDL_Texture *narrow_tex =
+        SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, kGameW, wide::kHeight);
+    int pic_w = kGameW;   // the width of the redraw in wide_px
     std::vector<uint32_t> wide_px;
     bool showing_wide = false;
 
@@ -787,6 +1244,9 @@ int run_window(bool force_fullscreen, const std::string &load_from)
     bool pad_wait_release = false;   // after the menu: ignore buttons still held from it
     bool infinite_lives = false;
     uint16_t lives_floor = 3;
+    Feel feel;
+    Rumble rumble;
+    std::vector<uint64_t> shown_at;   // when each recent picture reached the screen, for the counter
     const char *message = nullptr;
     uint64_t message_until = 0;
     std::vector<uint32_t> present(size_t(kViewW) * kViewH);
@@ -794,6 +1254,9 @@ int run_window(bool force_fullscreen, const std::string &load_from)
     menu::View view;
     view.settings = &set;
     view.style = pad_style(nullptr);
+#ifdef __PROSPERO__
+    view.can_fullscreen = false;   // the console always fills the screen
+#endif
     struct Held {
         bool on;
         uint64_t next;
@@ -817,7 +1280,7 @@ int run_window(bool force_fullscreen, const std::string &load_from)
     auto save_slot = [&](int n) {
         const char *result = quick_save(slot_path(n));
         if (showing_wide)
-            write_thumb(slot_path(n), wide_px.data(), wide_w, wide::kHeight);
+            write_thumb(slot_path(n), wide_px.data(), pic_w, wide::kHeight);
         else
             write_thumb(slot_path(n), present.data(), kViewW, kViewH);
         return result;
@@ -853,25 +1316,13 @@ int run_window(bool force_fullscreen, const std::string &load_from)
         }
     };
     // Esc does it on the Amiga; then a press of fire skips the story to the title.
-    auto quit_to_title = [&]() {
-        key_event(0x45, true);
-        for (int f = 0; f < 216; f++) {
-            if (f == 3)
-                key_event(0x45, false);
-            joy = Joystick{};
-            joy.fire = f >= 195 && f < 199;
-            run_frame();
-            wide::frame_done();
-            cheat_key_frame();
-        }
-        joy = Joystick{};
-        float discard[4096];
-        while (audio_take(discard, 2048) > 0) {
-        }
+    // After a jump made out of sight: start the sound and the clock afresh.
+    auto after_jump = [&]() {
         if (audio)
             SDL_ClearAudioStream(audio);
-        cheat_key = CheatKey{};
+        prefill();
         infinite_lives = false;
+        feel = Feel{};
         next = SDL_GetTicksNS();
     };
     auto handle = [&](menu::Request r) {
@@ -880,11 +1331,17 @@ int run_window(bool force_fullscreen, const std::string &load_from)
         case menu::Cmd::exit_game: running = false; break;
         case menu::Cmd::quit_to_title:
             close_menu();
-            quit_to_title();
-            prefill();
+            go_to_title();
+            after_jump();
+            break;
+        case menu::Cmd::play_section:
+            close_menu();
+            go_to_section(r.arg);
+            after_jump();
             break;
         case menu::Cmd::load:
             close_menu();
+            feel = Feel{};
             show(quick_load(slot_path(r.arg)));
             prefill();
             break;
@@ -897,6 +1354,17 @@ int run_window(bool force_fullscreen, const std::string &load_from)
             press_cheat_key(0x32);   // X
             break;
         case menu::Cmd::wings: write8(kWings, r.arg ? 0xFF : 0); break;   // what the cheat's F key flips
+        case menu::Cmd::continue_game:
+            close_menu();
+            feel = Feel{};
+            show(quick_load(resume_path()));
+            prefill();
+            break;
+        case menu::Cmd::start_fresh:
+            close_menu();
+            std::remove(resume_path().c_str());
+            std::remove((resume_path() + ".thumb").c_str());
+            break;
         case menu::Cmd::invincible: set_invincible(r.arg != 0); break;
         case menu::Cmd::infinite_lives:
             infinite_lives = r.arg != 0;
@@ -905,6 +1373,15 @@ int run_window(bool force_fullscreen, const std::string &load_from)
         default: break;
         }
     };
+
+    // Quit mid-level last time: offer to carry on from there.
+    SDL_Texture *continue_thumb = nullptr;
+    if (SDL_PathInfo info; load_from.empty() && SDL_GetPathInfo(resume_path().c_str(), &info)) {
+        continue_thumb = load_thumb(ren, resume_path());
+        menu::open_continue(continue_thumb, when_text(info.modify_time));
+        if (audio)
+            SDL_PauseAudioStreamDevice(audio);
+    }
 
     while (running) {
         uint64_t now = SDL_GetTicksNS();
@@ -1125,6 +1602,10 @@ int run_window(bool force_fullscreen, const std::string &load_from)
             if (set.sound_model != applied.sound_model || set.stereo != applied.stereo ||
                 set.volume != applied.volume || set.ring_out != applied.ring_out)
                 apply_audio(set);
+            if ((set.rumble_strength != applied.rumble_strength || set.rumble != applied.rumble) && set.rumble &&
+                pad)   // feel the new strength
+                SDL_RumbleGamepad(pad, Rumble::at_strength(0xD000, set.rumble_strength),
+                                  Rumble::at_strength(0x9000, set.rumble_strength), 200);
             applied = set;
         }
         if (!in_menu && set != written) {
@@ -1134,6 +1615,8 @@ int run_window(bool force_fullscreen, const std::string &load_from)
 
         // Between frames, so the machine is in a steady state.
         if (!in_menu && (want_save || want_load)) {
+            if (want_load)
+                feel = Feel{};
             show(want_save ? save_slot(0) : quick_load(quicksave_path()));
             if (want_load)
                 prefill();
@@ -1145,6 +1628,9 @@ int run_window(bool force_fullscreen, const std::string &load_from)
                 run_frame();
                 wide::frame_done();
                 cheat_key_frame();
+                // The pad feels Robocod's knocks, and shakes with the screen.
+                if (int what = feel.check(wide::playing()))
+                    rumble.felt(what, now);
                 if (infinite_lives && read16(kLives) < lives_floor)
                     write16(kLives, lives_floor);
                 record::frame();
@@ -1155,6 +1641,12 @@ int run_window(bool force_fullscreen, const std::string &load_from)
             }
             if (now > next + frame_ns * 5)
                 next = now;
+        }
+        if (pad) {
+            uint16_t lo, hi;
+            uint32_t hold;
+            if (rumble.step(set.rumble && !in_menu, feel.shake(), set.rumble_strength, now, lo, hi, hold))
+                SDL_RumbleGamepad(pad, lo, hi, hold);
         }
         if (ran) {
             float buf[4096];
@@ -1194,11 +1686,13 @@ int run_window(bool force_fullscreen, const std::string &load_from)
         if (in_menu) {
             // The game behind the menu, drawn as the settings now make it so a
             // picture setting shows at once; frosted over unless one has the focus.
-            showing_wide = set.widescreen && wide::render(wide_px.data(), wide_w, 1.0f, true);
-            SDL_Texture *game = showing_wide ? wide_tex : tex;
-            int gw = showing_wide ? wide_w : kViewW, gh = showing_wide ? wide::kHeight : kViewH;
+            pic_w = set.widescreen ? wide_w : kGameW;
+            showing_wide = wide::render(wide_px.data(), pic_w, 1.0f, true);
+            SDL_Texture *redrawn = set.widescreen ? wide_tex : narrow_tex;
+            SDL_Texture *game = showing_wide ? redrawn : tex;
+            int gw = showing_wide ? pic_w : kViewW, gh = showing_wide ? wide::kHeight : kViewH;
             if (showing_wide) {
-                SDL_UpdateTexture(wide_tex, nullptr, wide_px.data(), wide_w * 4);
+                SDL_UpdateTexture(redrawn, nullptr, wide_px.data(), pic_w * 4);
             } else {
                 for (int y = 0; y < kViewH; y++)
                     std::memcpy(&present[size_t(y) * kViewW], &framebuffer[(kViewY + y) * kFbW + kViewX],
@@ -1206,9 +1700,14 @@ int run_window(bool force_fullscreen, const std::string &load_from)
                 SDL_UpdateTexture(tex, nullptr, present.data(), kViewW * 4);
             }
             float clear = menu::preview();
-            presenter.draw(game, gw, gh, set.picture, set.scanlines);
-            if (clear < 0.999f)
-                presenter.draw_frosted(game, gw, gh, 1 - clear);
+            if (menu::asking_continue()) {   // behind the question: where the game was left
+                if (continue_thumb)
+                    presenter.draw_frosted(continue_thumb, kThumbW, kThumbH, 1);
+            } else {
+                presenter.draw(game, gw, gh, set.picture, set.scanlines);
+                if (clear < 0.999f)
+                    presenter.draw_frosted(game, gw, gh, 1 - clear);
+            }
             int ow = 0, oh = 0;
             SDL_GetRenderOutputSize(ren, &ow, &oh);
             ui::begin(ow, oh);
@@ -1247,6 +1746,7 @@ int run_window(bool force_fullscreen, const std::string &load_from)
             view.score = read32(kScore);
             view.lives = read16(kLives);
             view.energy = read16(kEnergy);
+            view.section = wide::playing() ? read16(kSection) : -1;
             menu::draw(view, std::min(dt, 0.1f));
         } else {
             // Where we are between the last game tick and the next (0..1).
@@ -1258,12 +1758,12 @@ int run_window(bool force_fullscreen, const std::string &load_from)
                     message = nullptr;
                 // Always the full redraw (it matches the game's own picture), moved
                 // between ticks only with smoothing on.
-                showing_wide =
-                    set.widescreen && wide::render(wide_px.data(), wide_w, set.smooth ? alpha : 1.0f, true);
+                pic_w = set.widescreen ? wide_w : kGameW;
+                showing_wide = wide::render(wide_px.data(), pic_w, set.smooth ? alpha : 1.0f, true);
                 if (showing_wide) {
                     if (show_message)
-                        draw_message(wide_px.data(), wide_w, wide::kHeight, message);
-                    SDL_UpdateTexture(wide_tex, nullptr, wide_px.data(), wide_w * 4);
+                        draw_message(wide_px.data(), pic_w, wide::kHeight, message);
+                    SDL_UpdateTexture(set.widescreen ? wide_tex : narrow_tex, nullptr, wide_px.data(), pic_w * 4);
                 } else {
                     for (int y = 0; y < kViewH; y++)
                         std::memcpy(&present[size_t(y) * kViewW], &framebuffer[(kViewY + y) * kFbW + kViewX],
@@ -1273,30 +1773,50 @@ int run_window(bool force_fullscreen, const std::string &load_from)
                     SDL_UpdateTexture(tex, nullptr, present.data(), kViewW * 4);
                 }
             }
-            // Widescreen play fills the window's shape; everything else keeps the 4:3 picture.
+            // Gameplay fills the window's height (widescreen also its width); title
+            // and menu screens show the whole Amiga screen.
             if (showing_wide)
-                presenter.draw(wide_tex, wide_w, wide::kHeight, set.picture, set.scanlines);
+                presenter.draw(set.widescreen ? wide_tex : narrow_tex, pic_w, wide::kHeight, set.picture, set.scanlines);
             else
                 presenter.draw(tex, kViewW, kViewH, set.picture, set.scanlines);
-        }
-        if (!shot_path.empty()) {
-            SDL_Surface *got = SDL_RenderReadPixels(ren, nullptr);
-            if (!got)
-                std::fprintf(stderr, "shot %s: %s\n", shot_path.c_str(), SDL_GetError());
-            if (got) {
-                if (SDL_Surface *argb = SDL_ConvertSurface(got, SDL_PIXELFORMAT_ARGB8888)) {
-                    write_png(shot_path.c_str(), static_cast<uint32_t *>(argb->pixels), argb->w, argb->h,
-                              argb->pitch / 4);
-                    SDL_DestroySurface(argb);
-                }
-                SDL_DestroySurface(got);
+            if (set.show_fps) {
+                shown_at.push_back(now);
+                while (!shown_at.empty() && now - shown_at.front() > 1000000000ull)
+                    shown_at.erase(shown_at.begin());
+                char fps[32];
+                std::snprintf(fps, sizeof fps, "%zu FPS", shown_at.size());
+                int ow = 0, oh = 0;
+                SDL_GetRenderOutputSize(ren, &ow, &oh);
+                ui::begin(ow, oh);
+                float tw = ui::text_width(ui::semibold, 20, fps) + 32;
+                ui::rect(24, 24, tw, 40, 20, ui::rgb(0x0A101C, 0.72f));
+                ui::text(ui::semibold, 20, 24 + tw / 2, 44, fps, ui::rgb(0xEEF2F8), ui::center);
             }
+        }
+        if (shot_path.empty() && ui::console_shot_asked())
+            shot_path = "/app0/userdata/shot.png";
+        if (!shot_path.empty()) {
+            ui::save_screen(ren, shot_path);
             shot_path.clear();
         }
         SDL_RenderPresent(ren);
     }
     if (set != written)
         settings::save(pref_dir() + "settings.ini", set);
+    // Leaving mid-level: keep the place for next time. Anywhere else (or
+    // without having answered the question at launch), leave things be.
+    if (!menu::asking_continue()) {
+        if (wide::playing()) {
+            quick_save(resume_path());
+            if (showing_wide)
+                write_thumb(resume_path(), wide_px.data(), pic_w, wide::kHeight);
+            else
+                write_thumb(resume_path(), present.data(), kViewW, kViewH);
+        } else {
+            std::remove(resume_path().c_str());
+            std::remove((resume_path() + ".thumb").c_str());
+        }
+    }
     SDL_Quit();
     record::finish();
     cpu_report();
@@ -1308,6 +1828,8 @@ int run_window(bool force_fullscreen, const std::string &load_from)
 int main(int argc, char **argv)
 {
     const char *adf = std::getenv("JP2_ADF");
+    if (const char *w = std::getenv("JP2_WATCH"))
+        data_watch = uint32_t(std::strtoul(w, nullptr, 16)) & ~1u;
     int headless = 0;
     std::vector<Shot> shots;
     std::vector<Press> script;
@@ -1342,9 +1864,37 @@ int main(int argc, char **argv)
             const char *v = argv[++i];
             if (const char *colon = std::strchr(v, ':'))
                 trace::arm(std::atoi(v), colon + 1);
+        } else if (!std::strcmp(argv[i], "--setup-shot") && i + 1 < argc) {
+            // "width,height,found,error:file.png": the first-run page off screen
+            const char *spec = argv[++i];
+            const char *colon = std::strchr(spec, ':');
+            int w = 1280, h = 800, found = 1, err = 0;
+            std::sscanf(spec, "%d,%d,%d,%d", &w, &h, &found, &err);
+            SDL_Surface *surf = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ARGB8888);
+            SDL_Renderer *ren = SDL_CreateSoftwareRenderer(surf);
+            ui::init(ren);
+            std::vector<std::string> list;
+            if (found)
+                list = {"/Users/you/Downloads/James Pond 2 - Codename RoboCod (1991)(Millennium)[cr SR].adf"};
+            setup::draw_for_test(w, h, list, err ? "x.dms: DMS images aren't supported: turn it into an ADF first" : "",
+                                 glyphs::Style::deck, "~/.local/share/bouncingball/James Pond 2");
+            SDL_RenderPresent(ren);
+            if (colon)
+                write_png(colon + 1, static_cast<uint32_t *>(surf->pixels), w, h, surf->pitch / 4);
+            return 0;
         } else if (!std::strcmp(argv[i], "--menu-shot") && i + 1 < argc) {
             menu_shot(argv[++i]);
             return 0;
+        } else if (!std::strcmp(argv[i], "--section") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (const char *colon = std::strchr(v, ':'))
+                section_jumps.push_back({std::atoi(v), int(std::strtoul(colon + 1, nullptr, 16))});
+        } else if (!std::strcmp(argv[i], "--poke") && i + 1 < argc) {
+            const char *v = argv[++i];
+            const char *colon = std::strchr(v, ':'), *eq = std::strchr(v, '=');
+            if (colon && eq)
+                pokes.push_back({std::atoi(v), uint32_t(std::strtoul(colon + 1, nullptr, 16)),
+                                 uint32_t(std::strtoul(eq + 1, nullptr, 16)), std::strlen(eq + 1) > 4});
         } else if (!std::strcmp(argv[i], "--picture-shot") && i + 1 < argc) {
             picture_shots.push_back(argv[++i]);
         } else if (!std::strcmp(argv[i], "--wav") && i + 1 < argc) {
@@ -1370,27 +1920,31 @@ int main(int argc, char **argv)
             }
         }
     }
-    // Double-clicked app: the disk image sits beside the program (inside the
-    // .app bundle that is Contents/Resources).
-    std::string bundled;
-    if (!adf) {
-        if (const char *base = SDL_GetBasePath()) {
-            bundled = std::string(base) + "jp2.adf";
-            adf = bundled.c_str();
+    // Where the disk can be: given (--adf or JP2_ADF), kept by the first-run
+    // page, or beside the program (a development install).
+    std::vector<std::string> disks;
+    if (adf)
+        disks.push_back(adf);
+    disks.push_back(stored_disk_path());
+    if (const char *base = SDL_GetBasePath())
+        disks.push_back(std::string(base) + "jp2.adf");
+#ifdef __PROSPERO__
+    // The console: whatever disk image the player copied into the game's folder.
+    for (const std::string &d :
+         setup::scan([](const std::string &p, std::string *err) { return disk::open(p.c_str(), err); }))
+        disks.push_back(d);
+    fullscreen = true;
+#endif
+    if (headless) {
+        std::string err = "no disk image (use --adf)";
+        bool ok = false;
+        for (const std::string &d : disks)
+            if (!d.empty() && (ok = game::boot(d.c_str(), &err)))
+                break;
+        if (!ok) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
         }
-    }
-    if (!adf) {
-        std::fprintf(stderr, "usage: %s --adf <James Pond 2 disk image>\n", argv[0]);
-        return 1;
-    }
-    std::string err;
-    if (!game::boot(adf, &err)) {
-        std::fprintf(stderr, "%s: %s\n", adf, err.c_str());
-        if (!headless) {
-            std::string msg = std::string("Couldn't start from the disk image:\n") + adf + "\n\n" + err;
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "James Pond 2", msg.c_str(), nullptr);
-        }
-        return 1;
     }
 #ifdef JP2_COVERAGE_DIR
     // Development builds: every play session saves the code that had to be
@@ -1406,12 +1960,22 @@ int main(int argc, char **argv)
     }
 #endif
     if (std::getenv("JP2_WIDE") || std::any_of(shots.begin(), shots.end(), [](const Shot &s) { return s.wide; }))
-        wide::set_view_extra((kWideW - 288) / 2);
-    if (record_dir)
-        record::start(record_dir);
-    if (cheat)
-        game::enable_cheat();
-    if (headless)
+        wide::set_view_extra((shot_width() - 288) / 2);
+    // After the machine has booted from the disk.
+    static const char *s_record_dir;
+    static bool s_cheat;
+    s_record_dir = record_dir;
+    s_cheat = cheat;
+    auto after_boot = []() {
+        paula_on_start(heard_sample);
+        if (s_record_dir)
+            record::start(s_record_dir);
+        if (s_cheat)
+            game::enable_cheat();
+    };
+    if (headless) {
+        after_boot();
         return run_headless(headless, shots, script, load_from, save_frame, save_to, wav_path);
-    return run_window(fullscreen, load_from);
+    }
+    return run_window(fullscreen, load_from, disks, after_boot);
 }

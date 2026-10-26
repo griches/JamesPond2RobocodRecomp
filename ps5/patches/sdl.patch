@@ -1,0 +1,190 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 90b368d..8c0cf9d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1329,6 +1329,38 @@ if(SDL_HAPTIC)
+ endif()
+ 
+ 
++# The PlayStation 5 (the payload SDK's toolchain sets PS5): a FreeBSD-like
++# system for threads, time and files, with the console's own video, audio and
++# pad drivers, kept outside this tree in SDL_PS5_PORT_DIR.
++if(PS5)
++  if(NOT SDL_PS5_PORT_DIR OR NOT SDL_PS5_PLATFORM_DIR)
++    message(FATAL_ERROR "PS5: set SDL_PS5_PORT_DIR (the drivers) and SDL_PS5_PLATFORM_DIR (platform.h)")
++  endif()
++  sdl_include_directories(PRIVATE "${SDL_PS5_PLATFORM_DIR}")
++  if(SDL_AUDIO)
++    set(SDL_AUDIO_DRIVER_PS5 1)
++    sdl_sources("${SDL_PS5_PORT_DIR}/SDL_ps5audio.c")
++    set(HAVE_SDL_AUDIO TRUE)
++  endif()
++  if(SDL_JOYSTICK)
++    set(SDL_JOYSTICK_PS5 1)
++    sdl_sources("${SDL_PS5_PORT_DIR}/SDL_ps5joystick.c")
++    set(HAVE_SDL_JOYSTICK TRUE)
++  endif()
++  if(SDL_VIDEO)
++    set(SDL_VIDEO_DRIVER_PS5 1)
++    sdl_sources("${SDL_PS5_PORT_DIR}/SDL_ps5video.c")
++    set(HAVE_SDL_VIDEO TRUE)
++    # Vulkan is RADV, linked into the title: SDL hands out its entry point and a VK_KHR_display surface
++    # (SDL_GPU's Vulkan backend draws through it)
++    set(SDL_VIDEO_VULKAN 1)
++    set(HAVE_VULKAN TRUE)
++    # ... and SDL's own 2D renderer (geow2's first-start setup screen)
++    set(SDL_VIDEO_RENDER_VULKAN 1)
++    set(HAVE_RENDER_VULKAN TRUE)
++  endif()
++endif()
++
+ # General SDL subsystem options, valid for all platforms
+ if(SDL_AUDIO)
+   # CheckDummyAudio/CheckDiskAudio - valid for all platforms
+diff --git a/include/build_config/SDL_build_config.h.cmake b/include/build_config/SDL_build_config.h.cmake
+index 17cb8f2..0cb0934 100644
+--- a/include/build_config/SDL_build_config.h.cmake
++++ b/include/build_config/SDL_build_config.h.cmake
+@@ -288,6 +288,7 @@
+ #cmakedefine SDL_AUDIO_DRIVER_VITA 1
+ #cmakedefine SDL_AUDIO_DRIVER_PSP 1
+ #cmakedefine SDL_AUDIO_DRIVER_PS2 1
++#cmakedefine SDL_AUDIO_DRIVER_PS5 1
+ #cmakedefine SDL_AUDIO_DRIVER_N3DS 1
+ #cmakedefine SDL_AUDIO_DRIVER_NGAGE 1
+ #cmakedefine SDL_AUDIO_DRIVER_QNX 1
+@@ -312,6 +313,7 @@
+ #cmakedefine SDL_JOYSTICK_MFI 1
+ #cmakedefine SDL_JOYSTICK_N3DS 1
+ #cmakedefine SDL_JOYSTICK_PS2 1
++#cmakedefine SDL_JOYSTICK_PS5 1
+ #cmakedefine SDL_JOYSTICK_PSP 1
+ #cmakedefine SDL_JOYSTICK_RAWINPUT 1
+ #cmakedefine SDL_JOYSTICK_USBHID 1
+@@ -407,6 +409,7 @@
+ #cmakedefine SDL_VIDEO_DRIVER_NGAGE 1
+ #cmakedefine SDL_VIDEO_DRIVER_OFFSCREEN 1
+ #cmakedefine SDL_VIDEO_DRIVER_PS2 1
++#cmakedefine SDL_VIDEO_DRIVER_PS5 1
+ #cmakedefine SDL_VIDEO_DRIVER_PSP 1
+ #cmakedefine SDL_VIDEO_DRIVER_RISCOS 1
+ #cmakedefine SDL_VIDEO_DRIVER_ROCKCHIP 1
+diff --git a/src/audio/SDL_audio.c b/src/audio/SDL_audio.c
+index aed406c..9ef0435 100644
+--- a/src/audio/SDL_audio.c
++++ b/src/audio/SDL_audio.c
+@@ -65,6 +65,9 @@ static const AudioBootStrap *const bootstrap[] = {
+ #ifdef SDL_AUDIO_DRIVER_OPENSLES
+     &OPENSLES_bootstrap,
+ #endif
++#ifdef SDL_AUDIO_DRIVER_PS5
++    &PS5AUDIO_bootstrap,
++#endif
+ #ifdef SDL_AUDIO_DRIVER_PS2
+     &PS2AUDIO_bootstrap,
+ #endif
+diff --git a/src/audio/SDL_sysaudio.h b/src/audio/SDL_sysaudio.h
+index 9104be8..fea29a1 100644
+--- a/src/audio/SDL_sysaudio.h
++++ b/src/audio/SDL_sysaudio.h
+@@ -384,6 +384,7 @@ extern AudioBootStrap DUMMYAUDIO_bootstrap;
+ extern AudioBootStrap AAUDIO_bootstrap;
+ extern AudioBootStrap OPENSLES_bootstrap;
+ extern AudioBootStrap PS2AUDIO_bootstrap;
++extern AudioBootStrap PS5AUDIO_bootstrap;
+ extern AudioBootStrap PSPAUDIO_bootstrap;
+ extern AudioBootStrap VITAAUD_bootstrap;
+ extern AudioBootStrap N3DSAUDIO_bootstrap;
+diff --git a/src/filesystem/unix/SDL_sysfilesystem.c b/src/filesystem/unix/SDL_sysfilesystem.c
+index a23d67b..1786134 100644
+--- a/src/filesystem/unix/SDL_sysfilesystem.c
++++ b/src/filesystem/unix/SDL_sysfilesystem.c
+@@ -240,6 +240,10 @@ static char *GetExePath(void)
+ 
+ char *SDL_SYS_GetBasePath(void)
+ {
++#ifdef __PROSPERO__
++    // PlayStation 5: a title's own folder is mounted at /app0
++    return SDL_strdup("/app0/");
++#else
+     char *path = GetExePath();
+     if (!path) {
+         return NULL;
+@@ -252,6 +256,7 @@ char *SDL_SYS_GetBasePath(void)
+ 
+     ptr = (char *) SDL_realloc(path, ((size_t) (ptr - path)) + 2);  // try to shrink this allocation down a little.
+     return ptr ? ptr : path;  // return shrunk buffer if shrink worked out, unchanged original buffer if not.
++#endif // __PROSPERO__
+ }
+ 
+ 
+diff --git a/src/gpu/vulkan/SDL_gpu_vulkan.c b/src/gpu/vulkan/SDL_gpu_vulkan.c
+index 2782f41..7a4939b 100644
+--- a/src/gpu/vulkan/SDL_gpu_vulkan.c
++++ b/src/gpu/vulkan/SDL_gpu_vulkan.c
+@@ -12149,7 +12149,13 @@ static bool VULKAN_INTERNAL_GetDeviceRank(
+             &physicalDeviceProperties);
+ 
+         if (physicalDeviceExtensions->KHR_driver_properties) {
++#ifdef __PROSPERO__
++            /* PlayStation 5: the console's RADV reports conformanceVersion 0.0.0.0
++             * until it passes the whole CTS there; it is the only GPU there is */
++            isConformant = true;
++#else
+             isConformant = (physicalDeviceDriverProperties.conformanceVersion.major >= 1);
++#endif
+         } else {
+             isConformant = true; // We can't check this, so just assume it's conformant
+         }
+diff --git a/src/joystick/SDL_joystick.c b/src/joystick/SDL_joystick.c
+index 3ee5c21..ccf0078 100644
+--- a/src/joystick/SDL_joystick.c
++++ b/src/joystick/SDL_joystick.c
+@@ -91,6 +91,9 @@ static SDL_JoystickDriver *SDL_joystick_drivers[] = {
+ #ifdef SDL_JOYSTICK_USBHID /* !!! FIXME: "USBHID" is a generic name, and doubly-confusing with HIDAPI next to it. This is the *BSD interface, rename this. */
+     &SDL_BSD_JoystickDriver,
+ #endif
++#ifdef SDL_JOYSTICK_PS5
++    &SDL_PS5_JoystickDriver,
++#endif
+ #ifdef SDL_JOYSTICK_PS2
+     &SDL_PS2_JoystickDriver,
+ #endif
+diff --git a/src/joystick/SDL_sysjoystick.h b/src/joystick/SDL_sysjoystick.h
+index 47ce42c..833d9a4 100644
+--- a/src/joystick/SDL_sysjoystick.h
++++ b/src/joystick/SDL_sysjoystick.h
+@@ -259,6 +259,7 @@ extern SDL_JoystickDriver SDL_WGI_JoystickDriver;
+ extern SDL_JoystickDriver SDL_WINDOWS_JoystickDriver;
+ extern SDL_JoystickDriver SDL_WINMM_JoystickDriver;
+ extern SDL_JoystickDriver SDL_PS2_JoystickDriver;
++extern SDL_JoystickDriver SDL_PS5_JoystickDriver;
+ extern SDL_JoystickDriver SDL_PSP_JoystickDriver;
+ extern SDL_JoystickDriver SDL_VITA_JoystickDriver;
+ extern SDL_JoystickDriver SDL_N3DS_JoystickDriver;
+diff --git a/src/video/SDL_sysvideo.h b/src/video/SDL_sysvideo.h
+index 1fdc5bf..4189995 100644
+--- a/src/video/SDL_sysvideo.h
++++ b/src/video/SDL_sysvideo.h
+@@ -530,6 +530,7 @@ extern VideoBootStrap HAIKU_bootstrap;
+ extern VideoBootStrap UIKIT_bootstrap;
+ extern VideoBootStrap Android_bootstrap;
+ extern VideoBootStrap PS2_bootstrap;
++extern VideoBootStrap PS5_bootstrap;
+ extern VideoBootStrap PSP_bootstrap;
+ extern VideoBootStrap VITA_bootstrap;
+ extern VideoBootStrap RISCOS_bootstrap;
+diff --git a/src/video/SDL_video.c b/src/video/SDL_video.c
+index 88f833e..e3edbfa 100644
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -116,6 +116,9 @@ static VideoBootStrap *bootstrap[] = {
+ #ifdef SDL_VIDEO_DRIVER_ANDROID
+     &Android_bootstrap,
+ #endif
++#ifdef SDL_VIDEO_DRIVER_PS5
++    &PS5_bootstrap,
++#endif
+ #ifdef SDL_VIDEO_DRIVER_PS2
+     &PS2_bootstrap,
+ #endif

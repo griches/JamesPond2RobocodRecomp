@@ -10,6 +10,7 @@
 // one function with an entry label per instruction, so the dispatcher can
 // start anywhere a jump, return or interrupt lands.
 #include "disk.h"
+#include "recomp_tables.h"
 #include "translate.h"
 
 #include <algorithm>
@@ -334,8 +335,11 @@ void write_tables(const std::string &dir, const std::vector<Chunk> &chunks)
         for (const Chunk &ch : chunks) {
             if (ch.img != &img)
                 continue;
-            for (uint32_t pc : ch.pcs)
-                std::fprintf(f, "    {0x%06Xu, %u, %s},\n", pc, img.code.at(pc).len, ch.fn.c_str());
+            for (uint32_t pc : ch.pcs) {
+                uint32_t len = img.code.at(pc).len;
+                std::fprintf(f, "    {0x%06Xu, %u, %s, 0x%08Xu},\n", pc, len, ch.fn.c_str(),
+                             jp2::code_sum(&img.bytes[pc - img.base], len));
+            }
         }
         std::fprintf(f, "};\n");
     }

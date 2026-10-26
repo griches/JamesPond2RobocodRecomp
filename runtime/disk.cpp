@@ -1,5 +1,9 @@
 #include "disk.h"
 
+extern "C" {
+#include "puff.h"
+}
+
 #include <cstdio>
 #include <cstring>
 
@@ -9,21 +13,198 @@ static std::vector<uint8_t> image;
 
 static uint32_t be32(const uint8_t *p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
-bool open(const char *adf_path, std::string *error)
+static bool read_whole(const std::string &path, std::vector<uint8_t> &out)
 {
-    FILE *f = std::fopen(adf_path, "rb");
-    if (!f) {
-        *error = std::string("can't open ") + adf_path;
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    bool ok = n > 0 && n < (64L << 20);
+    if (ok) {
+        out.resize(size_t(n));
+        ok = std::fread(out.data(), 1, out.size(), f) == out.size();
+    }
+    std::fclose(f);
+    return ok;
+}
+
+static uint16_t le16(const uint8_t *p) { return uint16_t(p[0] | p[1] << 8); }
+static uint32_t le32(const uint8_t *p) { return uint32_t(p[0] | p[1] << 8 | p[2] << 16 | uint32_t(p[3]) << 24); }
+
+// A raw deflate stream into `size` bytes.
+static bool inflate(const uint8_t *src, size_t len, size_t size, std::vector<uint8_t> &out)
+{
+    out.assign(size, 0);
+    unsigned long dlen = size, slen = len;
+    return puff(out.data(), &dlen, src, &slen) == 0 && dlen == size;
+}
+
+// The 128 files a WHDLoad install keeps as data/jp2_000 ... jp2_127, laid out
+// as a disk again: the file table at $2C00, the files after it.
+// 0: not a WHDLoad folder, 1: read, -1: a WHDLoad folder that didn't read.
+static int from_whdload(const std::string &dir, std::string *error)
+{
+    std::string base;
+    for (const char *sub : {"/data/jp2_", "/data/JP2_", "/jp2_", "/JP2_"}) {
+        std::vector<uint8_t> probe;
+        if (read_whole(dir + sub + "000", probe)) {
+            base = dir + sub;
+            break;
+        }
+    }
+    if (base.empty())
+        return 0;
+    image.assign(901120, 0);
+    uint32_t block = (kDirOffset + 128 * 8) / 512;
+    for (int n = 0; n < 128; n++) {
+        char num[8];
+        std::snprintf(num, sizeof num, "%03d", n);
+        std::vector<uint8_t> f;
+        if (!read_whole(base + num, f))
+            f.clear();   // the disk has a few empty entries
+        uint32_t at = block * 512;
+        if (at + f.size() > image.size()) {
+            *error = "the WHDLoad files don't fit on one disk";
+            return -1;
+        }
+        std::memcpy(&image[at], f.data(), f.size());
+        uint8_t *e = &image[kDirOffset + n * 8];
+        for (int k = 0; k < 4; k++) {
+            e[k] = uint8_t(block >> (24 - 8 * k));
+            e[4 + k] = uint8_t(f.size() >> (24 - 8 * k));
+        }
+        block += uint32_t((f.size() + 511) / 512);
+    }
+    return 1;
+}
+
+// The bytes of one disk image, whatever it came wrapped in.
+static bool unwrap(std::vector<uint8_t> data, int depth, std::string *error)
+{
+    auto starts = [&](const char *m) { return data.size() >= std::strlen(m) && std::memcmp(data.data(), m, std::strlen(m)) == 0; };
+    if (data.size() == 901120) {
+        image = std::move(data);
+        return true;
+    }
+    if (depth < 2 && data.size() > 18 && data[0] == 0x1F && data[1] == 0x8B && data[2] == 8) {   // gzip (.adz)
+        size_t at = 10;
+        uint8_t flags = data[3];
+        if (flags & 4)
+            at += 2 + le16(&data[at]);
+        for (int bit : {8, 16})   // name, comment
+            if (flags & bit)
+                while (at < data.size() && data[at++]) {
+                }
+        if (flags & 2)
+            at += 2;
+        uint32_t size = le32(&data[data.size() - 4]);
+        std::vector<uint8_t> out;
+        if (at < data.size() && size <= (16u << 20) && inflate(&data[at], data.size() - 8 - at, size, out))
+            return unwrap(std::move(out), depth + 1, error);
+        *error = "the compressed disk image is damaged";
         return false;
     }
-    image.assign(901120, 0);
-    size_t got = std::fread(image.data(), 1, image.size(), f);
-    std::fclose(f);
-    if (got != image.size()) {
-        *error = "not a standard 880 KB ADF";
+    if (depth < 2 && starts("PK\x03\x04")) {   // zip: the first entry that unpacks to a disk image
+        size_t eocd = data.size() >= 22 ? data.size() - 22 : 0;
+        while (eocd > 0 && le32(&data[eocd]) != 0x06054B50)
+            eocd--;
+        if (le32(&data[eocd]) == 0x06054B50) {
+            size_t cd = le32(&data[eocd + 16]), count = le16(&data[eocd + 10]);
+            for (size_t i = 0; i < count && cd + 46 <= data.size(); i++) {
+                if (le32(&data[cd]) != 0x02014B50)
+                    break;
+                uint16_t method = le16(&data[cd + 10]);
+                uint32_t csize = le32(&data[cd + 20]), usize = le32(&data[cd + 24]);
+                size_t name_len = le16(&data[cd + 28]), extra = le16(&data[cd + 30]), comment = le16(&data[cd + 32]);
+                size_t local = le32(&data[cd + 42]);
+                cd += 46 + name_len + extra + comment;
+                if (local + 30 > data.size() || usize > (16u << 20) || (method != 0 && method != 8))
+                    continue;
+                size_t at = local + 30 + le16(&data[local + 26]) + le16(&data[local + 28]);
+                if (at + csize > data.size())
+                    continue;
+                std::vector<uint8_t> out;
+                if (method == 0)
+                    out.assign(data.begin() + long(at), data.begin() + long(at + csize));
+                else if (!inflate(&data[at], csize, usize, out))
+                    continue;
+                std::string ignore;
+                if (unwrap(std::move(out), depth + 1, &ignore))
+                    return true;
+            }
+        }
+        *error = "there's no James Pond 2 disk image in that zip";
+        return false;
+    }
+    if (starts("UAE-1ADF") || starts("UAE--ADF"))
+        *error = "this is a raw-track image (extended ADF), such as a dump of the original copy-protected disk; "
+                 "it isn't supported yet";
+    else if (starts("DMS!"))
+        *error = "DMS images aren't supported: turn it into an ADF first (xDMS or WinUAE can)";
+    else if (starts("CAPS"))
+        *error = "IPF images aren't supported";
+    else if (data.size() > 7 && data[2] == '-' && data[3] == 'l' && data[4] == 'h')
+        *error = "that's an LHA archive: unpack it and choose the folder instead";
+    else
+        *error = "that isn't an Amiga disk image";
+    return false;
+}
+
+bool open(const char *path, std::string *error)
+{
+    image.clear();
+    int whd = from_whdload(path, error);
+    if (whd < 0) {
+        image.clear();
+        return false;
+    }
+    if (!whd) {
+        std::vector<uint8_t> data;
+        if (!read_whole(path, data)) {
+            *error = std::string("can't read ") + path;
+            return false;
+        }
+        if (!unwrap(std::move(data), 0, error))
+            return false;
+    }
+    // A James Pond 2 disk: its main program unpacks.
+    std::vector<uint8_t> prog, f;
+    if (!main_program(prog, error)) {
+        // The original Millennium release (as WHDLoad installs it) wraps its
+        // main program differently. Its game code is the same, but it isn't
+        // supported yet.
+        if (file(0, f) && crc16(f.data(), f.size()) == 0x6E83)
+            *error = "this is the original Millennium release, which isn't supported yet. The Kixx re-release, "
+                     "its WHDLoad install and the common cracked disks are";
+        else
+            *error = "this isn't the Amiga (OCS) James Pond 2 disk";
+        image.clear();
         return false;
     }
     return true;
+}
+
+bool save_image(const std::string &path)
+{
+    FILE *f = std::fopen(path.c_str(), "wb");
+    if (!f)
+        return false;
+    bool ok = std::fwrite(image.data(), 1, image.size(), f) == image.size();
+    return std::fclose(f) == 0 && ok;
+}
+
+// The CRC-16 WHDLoad tells releases apart with (CRC-16/ARC).
+uint16_t crc16(const uint8_t *p, size_t n)
+{
+    uint16_t c = 0;
+    for (size_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++)
+            c = c & 1 ? uint16_t((c >> 1) ^ 0xA001) : uint16_t(c >> 1);
+    }
+    return c;
 }
 
 const std::vector<uint8_t> &adf() { return image; }

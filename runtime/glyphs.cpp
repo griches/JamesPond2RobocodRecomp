@@ -45,7 +45,7 @@ float button_width(Style s, Button b, float size)
     if (b == Button::l1 || b == Button::r1)
         return pill_width(shoulder_label(s, b), size);
     if ((b == Button::menu || b == Button::view) && s == Style::playstation)
-        return size * 1.45f;
+        return size * 0.86f;   // as wide as the pill drawn, so a row of them lines up on the right
     return size;
 }
 
@@ -92,7 +92,7 @@ float button(Style s, Button b, float x, float cy, float size, float a)
     case Button::view: {
         // PlayStation: a small upright pill (Options / Create); the others a disc.
         if (s == Style::playstation)
-            ui::rect(x + w * 0.2f, cy - r, w * 0.6f, size, size * 0.3f, face);
+            ui::rect(x, cy - r, w, size, size * 0.3f, face);
         else
             ui::rect(x, cy - r, size, size, r, face);
         float mx = x + w / 2;

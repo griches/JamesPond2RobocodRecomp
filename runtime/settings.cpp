@@ -19,7 +19,7 @@ struct Field {
 const Field kFields[] = {
     {"widescreen", nullptr, &Settings::widescreen, 0, 1},
     {"smooth_motion", nullptr, &Settings::smooth, 0, 1},
-    {"picture", &Settings::picture, nullptr, 0, 2},
+    {"picture", &Settings::picture, nullptr, 0, 3},
     {"scanlines", &Settings::scanlines, nullptr, 0, 2},
     {"fullscreen", nullptr, &Settings::fullscreen, 0, 1},
     {"volume", &Settings::volume, nullptr, 0, 10},
@@ -27,6 +27,9 @@ const Field kFields[] = {
     {"stereo", &Settings::stereo, nullptr, 0, 3},
     {"up_jumps", nullptr, &Settings::up_jumps, 0, 1},
     {"ring_out", nullptr, &Settings::ring_out, 0, 1},
+    {"rumble", nullptr, &Settings::rumble, 0, 1},
+    {"rumble_strength", &Settings::rumble_strength, nullptr, 1, 10},
+    {"show_fps", nullptr, &Settings::show_fps, 0, 1},
 };
 
 } // namespace

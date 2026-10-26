@@ -1,11 +1,16 @@
 #include "ui.h"
 
+#include "png.h"
+
 #define STB_TRUETYPE_IMPLEMENTATION
 #define STBTT_STATIC
 #include "stb_truetype.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <thread>
 #include <vector>
 
 // The fonts, built into the program (res/fonts, embedded by CMake).
@@ -35,7 +40,8 @@ const std::vector<int> &codepoints(int font)
         txt.insert(txt.end(), std::begin(kExtra), std::end(kExtra));
         using namespace icon_id;
         ico = {game, save, load, display, sound, cheats, controls, info, done, play, home, quit, star, heart,
-               bolt, add, clock, eye, shield, infinite, flight, skip, music, keyboard, wave, monitor, joystick};
+               bolt, add, clock, eye, shield, infinite, flight, skip, music, keyboard, wave, monitor, joystick,
+               folder};
     }
     return font == icons ? ico : txt;
 }
@@ -422,12 +428,88 @@ void icon(int cp, float size, float cx, float cy, Color c)
     SDL_RenderGeometry(ren, a->tex, v.data(), int(v.size()), idx.data(), int(idx.size()));
 }
 
+// A picture cut to a rounded rectangle: the inside as a fan, then a
+// one-pixel band fading out at the edge so the corners aren't jagged.
+void image_rounded(SDL_Texture *t, float x, float y, float w, float h, float r, float a)
+{
+    std::vector<SDL_FPoint> in, out;
+    outline(x, y, w, h, r, -0.5f, in);
+    outline(x, y, w, h, r, 0.5f, out);
+    float px0 = X(x), py0 = Y(y), pw = w * s, ph = h * s;
+    auto uv = [&](SDL_FPoint p) {
+        return SDL_FPoint{std::clamp((p.x - px0) / pw, 0.0f, 1.0f), std::clamp((p.y - py0) / ph, 0.0f, 1.0f)};
+    };
+    SDL_FColor full{1, 1, 1, a}, none{1, 1, 1, 0};
+    std::vector<SDL_Vertex> v;
+    std::vector<int> idx;
+    SDL_FPoint mid{X(x + w * 0.5f), Y(y + h * 0.5f)};
+    v.push_back({mid, full, uv(mid)});
+    for (const SDL_FPoint &p : in)
+        v.push_back({p, full, uv(p)});
+    int n = int(in.size());
+    for (int i = 0; i < n; i++)
+        for (int k : {0, 1 + i, 1 + (i + 1) % n})
+            idx.push_back(k);
+    int b = int(v.size());
+    for (int i = 0; i < n; i++) {
+        v.push_back({in[i], full, uv(in[i])});
+        v.push_back({out[i], none, uv(out[i])});
+    }
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        int a0 = b + i * 2, a1 = a0 + 1, b0 = b + j * 2, b1 = b0 + 1;
+        for (int k : {a0, a1, b1, a0, b1, b0})
+            idx.push_back(k);
+    }
+    SDL_RenderGeometry(ren, t, v.data(), int(v.size()), idx.data(), int(idx.size()));
+}
+
 void image(SDL_Texture *t, float x, float y, float w, float h, float a)
 {
     SDL_SetTextureAlphaModFloat(t, a);
     SDL_FRect d{X(x), Y(y), w * s, h * s};
     SDL_RenderTexture(ren, t, nullptr, &d);
     SDL_SetTextureAlphaModFloat(t, 1);
+}
+
+void save_screen(SDL_Renderer *ren, const std::string &path)
+{
+    SDL_Surface *got = SDL_RenderReadPixels(ren, nullptr);
+    if (!got) {
+        std::fprintf(stderr, "shot %s: %s\n", path.c_str(), SDL_GetError());
+        return;
+    }
+    if (got->w > 1920)
+        if (SDL_Surface *half = SDL_ScaleSurface(got, got->w / 2, got->h / 2, SDL_SCALEMODE_LINEAR)) {
+            SDL_DestroySurface(got);
+            got = half;
+        }
+    if (SDL_Surface *argb = SDL_ConvertSurface(got, SDL_PIXELFORMAT_ARGB8888)) {
+        std::vector<uint32_t> px(size_t(argb->w) * size_t(argb->h));
+        for (int y = 0; y < argb->h; y++)
+            std::memcpy(&px[size_t(y) * size_t(argb->w)],
+                        static_cast<uint8_t *>(argb->pixels) + size_t(y) * size_t(argb->pitch), size_t(argb->w) * 4);
+        std::thread([path, px = std::move(px), w = argb->w, h = argb->h] {
+            write_png(path.c_str(), px.data(), w, h, w);
+        }).detach();
+        SDL_DestroySurface(argb);
+    }
+    SDL_DestroySurface(got);
+}
+
+bool console_shot_asked()
+{
+#ifdef __PROSPERO__
+    // (SDL_RemovePath says yes to a file that isn't there, so look first.)
+    static uint64_t checked;
+    uint64_t now = SDL_GetTicksNS();
+    if (now - checked < 500000000ull)
+        return false;
+    checked = now;
+    return SDL_GetPathInfo("/app0/devloop-shot", nullptr) && SDL_RemovePath("/app0/devloop-shot");
+#else
+    return false;
+#endif
 }
 
 } // namespace ui

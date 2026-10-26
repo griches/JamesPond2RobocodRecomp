@@ -1,5 +1,6 @@
 // Address decoding for the 68000 side: RAM, custom chips, CIAs.
 #include "amiga.h"
+#include "cpu.h"
 
 #include <cstdio>
 
@@ -20,6 +21,21 @@ static inline void watch(uint32_t a)
 {
     if (code_watch && code_watch[a >> 1])
         code_write_seen(a);
+}
+
+uint32_t data_watch;
+int watch_frame;
+void data_written(uint32_t a, uint16_t v, bool blitter)
+{
+    if (blitter)
+        std::printf("watch frame %d line %d: blitter wrote %04X at $%06X (con %04X %04X, D $%04X%04X mod %d, size %04X, "
+                    "A $%04X%04X mod %d)\n",
+                    watch_frame, beam_line(), v, a, regs[0x40 >> 1], regs[0x42 >> 1], regs[0x54 >> 1], regs[0x56 >> 1],
+                    int16_t(regs[0x66 >> 1]), regs[0x58 >> 1], regs[0x50 >> 1], regs[0x52 >> 1],
+                    int16_t(regs[0x64 >> 1]));
+    else
+        std::printf("watch frame %d line %d: cpu wrote %04X at $%06X, pc %06X\n", watch_frame, beam_line(), v, a,
+                    cpu_instruction_pc());
 }
 
 static void unmapped(const char *what, uint32_t a)
@@ -86,6 +102,8 @@ void write8(uint32_t a, uint8_t v)
     if (a < kRamSize) {
         watch(a);
         touch(a);
+        if (data_watch && (a & ~1u) == data_watch)
+            data_written(a, v, false);
         ram[a] = v;
         return;
     }
@@ -111,6 +129,8 @@ void write16(uint32_t a, uint16_t v)
         watch(a);
         touch(a);
         touch(a + 1);
+        if (data_watch && (a & ~1u) == data_watch)
+            data_written(a, v, false);
         ram[a] = uint8_t(v >> 8);
         ram[a + 1] = uint8_t(v);
         return;

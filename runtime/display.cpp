@@ -215,6 +215,8 @@ static void fetch_line()
         playfield_start.diwstop = regs[0x090 >> 1];
         playfield_start.ddfstrt = regs[0x092 >> 1];
         playfield_start.ddfstop = regs[0x094 >> 1];
+        playfield_start.bpl1mod = int16_t(regs[0x108 >> 1]);
+        playfield_start.bpl2mod = int16_t(regs[0x10A >> 1]);
     }
 
     int strt = regs[0x092 >> 1] & 0xFC, stop = regs[0x094 >> 1] & 0xFC;

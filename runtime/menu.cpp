@@ -1,5 +1,6 @@
 #include "menu.h"
 
+#include "theme.h"
 #include "ui.h"
 
 #include <algorithm>
@@ -18,25 +19,15 @@ namespace icon = ui::icon_id;
 
 // ---- the look ------------------------------------------------------------------
 
-const Color kBg = ui::rgb(0x0A101C);
-const Color kSurface = ui::rgb(0x141F33);   // the panel, at its top
-const Color kSurface2 = ui::rgb(0x0F182A);  // ... and its bottom
-const Color kRaised = ui::rgb(0x1D2C48);    // the focused row, the open page's plate
-const Color kInk = ui::rgb(0xEEF2F8);
-const Color kDim = ui::rgb(0x98A4BA);
-const Color kFaint = ui::rgb(0x5D6982);
-const Color kAccent = ui::rgb(0xFFB547);    // focus and "on"
-const Color kDeep = ui::rgb(0x0A101C);
+using namespace theme;
 
-constexpr float kMargin = 96;
 constexpr float kRailX = kMargin, kRailY = 236, kRailW = 372, kRailH = 66, kRailPitch = 76;
 constexpr float kPanelX = 504, kPanelY = 236, kPanelH = 692;
 constexpr float kRowX = kPanelX + 24, kRowsY = kPanelY + 104;
 constexpr float kRowH = 72, kRowPitch = 80;
 constexpr float kSlotH = 104, kSlotPitch = 116, kSlotListW = 470;
-constexpr float kInfoH = 50, kInfoPitch = 54;
+constexpr float kInfoH = 46, kInfoPitch = 50;
 constexpr float kFooterY = kPanelY + kPanelH - 84;
-constexpr float kRadius = 18;
 
 float panel_w() { return ui::page_width() - kPanelX - kMargin; }
 float row_w() { return panel_w() - 48; }
@@ -44,7 +35,7 @@ float row_right() { return kRowX + row_w(); }
 
 // ---- what the pages hold -----------------------------------------------------------
 
-enum class Kind { action, toggle, choice, slider, slot, info };
+enum class Kind { action, toggle, choice, slider, slot, info, stepper };
 
 struct Row {
     const char *label;
@@ -55,14 +46,54 @@ struct Row {
     Request (*set)(const View &, int) = nullptr;
     std::vector<const char *> choices;                // choice
     int lo = 0, hi = 1;                               // slider
+    bool lo_is_off = false;                           // slider: the lowest value reads "Off"
     Request req;                                      // action, slot
     const char *ask_title = nullptr, *ask_body = nullptr, *ask_button = nullptr;   // ask first
     int slot = 0;                                     // slot
     bool preview = false;                             // let the game show through while focused
     bool (*enabled)(const View &) = nullptr;
+    int (*count)(const View &) = nullptr;               // stepper: how many values
+    std::string (*text)(const View &) = nullptr;        // stepper: the value shown
 };
 
-enum PageId { kGame, kSave, kLoad, kDisplay, kSound, kCheats, kControls };
+enum PageId { kGame, kSave, kLoad, kLevels, kDisplay, kSound, kCheats, kControls };
+
+// The game's sections (levels) by world, in the order they are played. The
+// game has no names for them; a world is one of its seven sets of graphics.
+struct Level {
+    int section;
+    const char *tag;   // "Boss", "Bonus room", or null
+};
+struct World {
+    const char *name;
+    std::vector<Level> levels;
+};
+const std::vector<World> &worlds()
+{
+    static const std::vector<World> w = {
+        {"The castle", {{0x00, "The roof"}, {0x40, "The hall"}, {0x2E, "Arctic Toys"}, {0x50, "The ending"}}},
+        {"Games room",
+         {{0x01}, {0x02}, {0x03}, {0x04}, {0x05}, {0x06}, {0x07}, {0x08}, {0x09}, {0x0A}, {0x0B}, {0x48}, {0x4B},
+          {0x11, "Boss"}}},
+        {"Cakes and toys",
+         {{0x0C}, {0x0E}, {0x0F}, {0x0D}, {0x10, "Boss"}, {0x25}, {0x26}, {0x27}, {0x28}, {0x29}, {0x2A}, {0x2C},
+          {0x2D}, {0x41}, {0x46}, {0x49}, {0x4A}, {0x47, "Bonus room"}}},
+        {"Sweets",
+         {{0x13}, {0x14}, {0x15}, {0x17}, {0x18}, {0x19}, {0x1A, "Upside down"}, {0x16, "Bonus room"}, {0x42},
+          {0x43}, {0x44}, {0x45, "Upside down"}}},
+        {"Transport",
+         {{0x1C}, {0x1B}, {0x1E}, {0x1D}, {0x21}, {0x22}, {0x23}, {0x20}, {0x1F, "Bonus room"},
+          {0x24, "Bonus room"}, {0x2B, "Boss"}}},
+        {"Music",
+         {{0x39}, {0x3A}, {0x3B}, {0x3C}, {0x3D}, {0x3E}, {0x3F}, {0x4F}, {0x4E}, {0x4D}, {0x4C, "Bonus room"},
+          {0x12, "Boss"}}},
+        {"Bath time",
+         {{0x30}, {0x31}, {0x32}, {0x33}, {0x34}, {0x35}, {0x37}, {0x38}, {0x36}, {0x2F, "Bonus room"}}},
+    };
+    return w;
+}
+int world_no, level_no;   // the Levels page's choice
+bool levels_synced;       // set to where the game is, once per opening
 
 struct Page {
     const char *name;
@@ -139,6 +170,43 @@ const std::vector<Page> &pages()
         p.push_back(sl);
     }
 
+    Page levels{"Levels", icon::star, "Any level of the game, through its own map selector.", {}};
+    {
+        Row r{"World", "The game's seven worlds, each with its own look.", Kind::stepper};
+        r.get = [](const View &) { return world_no; };
+        r.set = [](const View &, int x) {
+            world_no = x;
+            level_no = 0;
+            return Request{};
+        };
+        r.count = [](const View &) { return int(worlds().size()); };
+        r.text = [](const View &) { return std::string(worlds()[size_t(world_no)].name); };
+        levels.rows.push_back(r);
+    }
+    {
+        Row r{"Level", "Its levels in the order the game plays them.", Kind::stepper};
+        r.get = [](const View &) { return level_no; };
+        r.set = [](const View &, int x) {
+            level_no = x;
+            return Request{};
+        };
+        r.count = [](const View &) { return int(worlds()[size_t(world_no)].levels.size()); };
+        r.text = [](const View &) {
+            const World &w = worlds()[size_t(world_no)];
+            const Level &l = w.levels[size_t(level_no)];
+            std::string t = std::to_string(level_no + 1) + " of " + std::to_string(w.levels.size());
+            return l.tag ? t + "  \xC2\xB7  " + l.tag : t;
+        };
+        levels.rows.push_back(r);
+    }
+    {
+        Row r = action("Play this level", "Starts a new game there: the score starts at 0, with three lives.",
+                       Cmd::play_section, icon::play);
+        r.ask_title = "";   // asked with the level's name, in input()
+        levels.rows.push_back(r);
+    }
+    p.push_back(levels);
+
     Page display{"Display", icon::display, "How the game fills the screen.", {}};
     {
         Row r = toggle(
@@ -156,9 +224,9 @@ const std::vector<Page> &pages()
     {
         Row r = choice(
             "Picture",
-            "Crisp keeps every pixel sharp and the same size at any scale. Pixel perfect scales by whole numbers "
-            "and leaves a border. Soft blends neighbouring pixels.",
-            {"Crisp", "Pixel perfect", "Soft"}, [](const View &v) { return S(v).picture; },
+            "Crisp keeps every pixel sharp and even. Pixel perfect scales by whole numbers with a border. Soft "
+            "blends a little. CRT is a television of the time: soft lines, glow, scanlines and curved glass.",
+            {"Crisp", "Pixel perfect", "Soft", "CRT"}, [](const View &v) { return S(v).picture; },
             [](const View &v, int x) { S(v).picture = x; return Request{}; });
         r.preview = true;
         display.rows.push_back(r);
@@ -171,6 +239,10 @@ const std::vector<Page> &pages()
         r.preview = true;
         display.rows.push_back(r);
     }
+    display.rows.push_back(toggle(
+        "Frame rate counter", "Shows how many pictures a second reach the screen, in the top left corner.",
+        [](const View &v) { return int(S(v).show_fps); },
+        [](const View &v, int x) { S(v).show_fps = x != 0; return Request{}; }));
     {
         Row r = toggle(
             "Full screen", "Fill the display. On a Steam Deck the game always fills the screen.",
@@ -250,7 +322,24 @@ const std::vector<Page> &pages()
         "can't jump by accident.",
         [](const View &v) { return int(S(v).up_jumps); },
         [](const View &v, int x) { S(v).up_jumps = x != 0; return Request{}; }));
-    for (const char *name : {"Move", "Jump", "Stretch", "Quick save", "Quick load", "Smooth motion", "This menu"})
+    {
+        Row r{"Rumble",
+              "A buzz when Robocod is hit or loses a life, a thump with each explosion, and a shake when the screen "
+              "shakes. 5 is the standard strength; you feel each change.",
+              Kind::slider};
+        r.lo = 0;
+        r.hi = 10;
+        r.lo_is_off = true;
+        r.get = [](const View &v) { return S(v).rumble ? S(v).rumble_strength : 0; };
+        r.set = [](const View &v, int x) {
+            S(v).rumble = x > 0;
+            if (x > 0)
+                S(v).rumble_strength = x;
+            return Request{};
+        };
+        controls.rows.push_back(r);
+    }
+    for (const char *name : {"Move", "Jump", "Stretch", "Quick save and load", "Smooth motion", "This menu"})
         controls.rows.push_back(Row{name, nullptr, Kind::info});
     p.push_back(controls);
     return p;
@@ -271,6 +360,10 @@ struct Dialog {
 };
 
 bool showing;
+bool continue_mode;             // the launch question instead of the pages
+SDL_Texture *continue_thumb;
+std::string continue_when;
+int continue_focus = 1;         // 0 title screen, 1 continue
 int page_no, row_no;
 bool in_rows;
 Dialog dialog;
@@ -296,8 +389,12 @@ float row_y(const Page &p, int i)
 {
     if (p.rows[size_t(i)].kind == Kind::slot)
         return kRowsY + float(i) * kSlotPitch;
-    if (p.rows[size_t(i)].kind == Kind::info)   // under the toggle and the column names
-        return kRowsY + kRowPitch + 40 + float(i - 1) * kInfoPitch;
+    if (p.rows[size_t(i)].kind == Kind::info) {   // under the toggles and the column names
+        int first = 0;
+        while (p.rows[size_t(first)].kind != Kind::info)
+            first++;
+        return kRowsY + float(first) * kRowPitch + 30 + float(i - first) * kInfoPitch;
+    }
     return kRowsY + float(i) * kRowPitch;
 }
 float row_h(const Row &r) { return r.kind == Kind::slot ? kSlotH : r.kind == Kind::info ? kInfoH : kRowH; }
@@ -449,13 +546,13 @@ void draw_slider(float xr, float cy, const Row &r, int value, float pos)
     ui::rect(kx - 13, cy - 13, 26, 26, 13, F(kInk));
     char num[8];
     std::snprintf(num, sizeof num, "%d", value);
-    ui::text(ui::semibold, 25, xr, cy, num, F(kInk), ui::right);
+    ui::text(ui::semibold, 25, xr, cy, r.lo_is_off && value == r.lo ? "Off" : num, F(kInk), ui::right);
 }
 
 void draw_thumb(const Slot &s, float x, float y, float w, float h, float radius, bool enabled)
 {
     if (s.thumb) {
-        ui::image(s.thumb, x, y, w, h, fade * (enabled ? 1.0f : 0.5f));
+        ui::image_rounded(s.thumb, x, y, w, h, radius, fade * (enabled ? 1.0f : 0.5f));
         ui::ring(x, y, w, h, radius, 1, F(ui::alpha(kInk, 0.16f)));
         return;
     }
@@ -593,6 +690,42 @@ void draw_sound_card(const View &v, float y)
     }
 }
 
+// The chosen world's levels as a row of tags, the chosen one lit, and where
+// the game is now.
+void draw_levels_card(const View &v, float y)
+{
+    float x = kRowX, w = row_w(), h = 200;
+    ui::rect_v(x, y, w, h, kRadius, F(ui::alpha(kInk, 0.045f)), F(ui::alpha(kInk, 0.02f)));
+    const World &world = worlds()[size_t(world_no)];
+    small_caps(x + 32, y + 38, "IN THIS WORLD", kFaint);
+    float cx = x + 32, cy = y + 64;
+    for (size_t i = 0; i < world.levels.size(); i++) {
+        const Level &l = world.levels[i];
+        std::string t = l.tag && std::string(l.tag) == "Boss"         ? "Boss"
+                        : l.tag && std::string(l.tag) == "Bonus room" ? "Bonus"
+                                                                      : std::to_string(i + 1);
+        float tw = std::max(44.0f, ui::text_width(ui::semibold, 18, t.c_str()) + 26);
+        if (cx + tw > x + w - 32) {
+            cx = x + 32;
+            cy += 46;
+        }
+        bool chosen = int(i) == level_no, here = l.section == v.section;
+        ui::rect(cx, cy, tw, 36, 18, F(chosen ? kAccent : ui::alpha(kInk, here ? 0.18f : 0.07f)));
+        if (here && !chosen)
+            ui::ring(cx, cy, tw, 36, 18, 1.5f, F(ui::alpha(kAccent, 0.8f)));
+        ui::text(ui::semibold, 18, cx + tw / 2, cy + 18, t.c_str(), F(chosen ? kDeep : kInk), ui::center);
+        cx += tw + 8;
+    }
+    // Where the game is now.
+    std::string where = "Not in a level";
+    for (size_t wi = 0; wi < worlds().size(); wi++)
+        for (size_t li = 0; li < worlds()[wi].levels.size(); li++)
+            if (worlds()[wi].levels[li].section == v.section)
+                where = std::string("You're in ") + worlds()[wi].name + ", level " + std::to_string(li + 1);
+    ui::icon(icon::eye, 22, x + 43, y + h - 30, F(kFaint));
+    ui::text(ui::regular, 20, x + 66, y + h - 30, where.c_str(), F(kDim));
+}
+
 // The controls table: the pad's buttons and the keyboard's keys.
 void draw_controls_row(const View &v, const Row &r, float y)
 {
@@ -611,12 +744,9 @@ void draw_controls_row(const View &v, const Row &r, float y)
     } else if (what == "Stretch") {
         pad = {Button::east, Button::west};
         keys = {"Space"};
-    } else if (what == "Quick save") {
-        pad = {Button::l1};
-        keys = {"F5"};
-    } else if (what == "Quick load") {
-        pad = {Button::r1};
-        keys = {"F8"};
+    } else if (what == "Quick save and load") {
+        pad = {Button::l1, Button::r1};
+        keys = {"F5", "F8"};
     } else if (what == "Smooth motion") {
         pad = {Button::north};
         keys = {"4"};
@@ -641,8 +771,22 @@ void draw_controls_row(const View &v, const Row &r, float y)
 
 } // namespace
 
+void open_continue(SDL_Texture *thumb, const std::string &when)
+{
+    showing = true;
+    continue_mode = true;
+    continue_thumb = thumb;
+    continue_when = when;
+    continue_focus = 1;
+    open_age = 0;
+}
+
+bool asking_continue() { return showing && continue_mode; }
+
 void open()
 {
+    continue_mode = false;
+    levels_synced = false;
     showing = true;
     in_rows = false;
     dialog = Dialog{};
@@ -657,6 +801,7 @@ bool is_open() { return showing; }
 void close()
 {
     showing = false;
+    continue_mode = false;
     dialog.open = false;
 }
 
@@ -687,6 +832,17 @@ bool sound_preview() { return showing && page_no == kSound && !dialog.open; }
 Request input(Action a, const View &v)
 {
     const std::vector<Page> &ps = pages();
+    if (continue_mode) {
+        switch (a) {
+        case Action::left: continue_focus = 0; break;
+        case Action::right: continue_focus = 1; break;
+        case Action::confirm: return {continue_focus ? Cmd::continue_game : Cmd::start_fresh};
+        case Action::back: return {Cmd::start_fresh};
+        case Action::close: return {Cmd::continue_game};
+        default: break;
+        }
+        return {};
+    }
     if (dialog.open) {
         switch (a) {
         case Action::left: dialog.focus = 0; break;
@@ -737,7 +893,11 @@ Request input(Action a, const View &v)
     case Action::left:
     case Action::right: {
         int dir = a == Action::right ? 1 : -1;
-        if (r.kind == Kind::choice && on) {
+        if (r.kind == Kind::stepper && on) {
+            int x = r.get(v) + dir;
+            if (x >= 0 && x < r.count(v))
+                return r.set(v, x);
+        } else if (r.kind == Kind::choice && on) {
             int x = r.get(v) + dir;
             if (x >= 0 && x < int(r.choices.size()))
                 return r.set(v, x);
@@ -760,6 +920,16 @@ Request input(Action a, const View &v)
             return r.set(v, !r.get(v));
         if (r.kind == Kind::choice)
             return r.set(v, (r.get(v) + 1) % int(r.choices.size()));
+        if (r.kind == Kind::action && r.req.cmd == Cmd::play_section) {
+            const World &w = worlds()[size_t(world_no)];
+            static std::string title;
+            title = "Play " + std::string(w.name) + ", level " + std::to_string(level_no + 1) + "?";
+            ask(title.c_str(), "It starts a new game: score 0, three lives.", "Play", icon::star,
+                {Cmd::play_section, w.levels[size_t(level_no)].section});
+            return {};
+        }
+        if (r.kind == Kind::stepper)
+            return {};
         if (r.kind == Kind::action) {
             if (r.ask_title) {
                 ask(r.ask_title, r.ask_body, r.ask_button, r.icon, r.req);
@@ -785,8 +955,59 @@ Request input(Action a, const View &v)
     return {};
 }
 
+// The launch question: a card over the picture of where the game was left.
+static void draw_continue(const View &v, float dt)
+{
+    open_age += dt;
+    fade = ease(open_age / 0.25f);
+    float pw = ui::page_width();
+    float cw = 1060, ch = 470, cx = (pw - cw) / 2, cy = 300;
+    ui::glow(cx, cy, cw, ch, 28, 50, F(ui::alpha(kDeep, 0.6f)));
+    ui::rect_v(cx, cy, cw, ch, 28, F(ui::alpha(kSurface, 0.97f)), F(ui::alpha(kSurface2, 0.97f)));
+    ui::ring(cx, cy, cw, ch, 28, 1, F(ui::alpha(kInk, 0.08f)));
+    float tw = 448, th = tw * 9 / 16, tx = cx + 48, ty = cy + 48;
+    if (continue_thumb) {
+        ui::image_rounded(continue_thumb, tx, ty, tw, th, 14, fade);
+        ui::ring(tx, ty, tw, th, 14, 1, F(ui::alpha(kInk, 0.16f)));
+    }
+    float x = tx + tw + 48;
+    ui::text(ui::semibold, 16, x, ty + 22, "WELCOME BACK", F(kAccent), ui::left, 3);
+    ui::text(ui::semibold, 40, x, ty + 82, "Carry on where", F(kInk));
+    ui::text(ui::semibold, 40, x, ty + 132, "you left off?", F(kInk));
+    ui::icon(icon::clock, 22, x + 11, ty + 192, F(kDim));
+    ui::text(ui::regular, 22, x + 32, ty + 192, continue_when.c_str(), F(kDim));
+    float bw = (cw - 48 * 2 - 20) / 2, by = cy + ch - 48 - 72;
+    const char *labels[2] = {"Title screen", "Continue"};
+    const int icons[2] = {icon::home, icon::play};
+    for (int i = 0; i < 2; i++) {
+        float bx = cx + 48 + float(i) * (bw + 20);
+        if (continue_focus == i)
+            draw_focus({bx, by, bw, 72});
+        else
+            ui::rect(bx, by, bw, 72, kRadius, F(ui::alpha(kInk, 0.06f)));
+        float lw = ui::text_width(ui::semibold, 25, labels[i]);
+        ui::icon(icons[i], 28, bx + bw / 2 - lw / 2 - 22, by + 36, F(continue_focus == i ? kAccent : kDim));
+        ui::text(ui::semibold, 25, bx + bw / 2 + 14, by + 36, labels[i], F(kInk), ui::center);
+    }
+    std::vector<Hint> hints = {{{Button::south}, {"Enter"}, "Choose"}};
+    draw_hints(v, hints);
+}
+
 void draw(const View &v, float dt)
 {
+    if (continue_mode) {
+        draw_continue(v, dt);
+        return;
+    }
+    if (!levels_synced) {   // the Levels page starts at the level being played
+        levels_synced = true;
+        for (size_t wi = 0; wi < worlds().size(); wi++)
+            for (size_t li = 0; li < worlds()[wi].levels.size(); li++)
+                if (worlds()[wi].levels[li].section == v.section) {
+                    world_no = int(wi);
+                    level_no = int(li);
+                }
+    }
     const std::vector<Page> &ps = pages();
     const Page &page = ps[size_t(page_no)];
     const Row *focused_row = in_rows ? &page.rows[size_t(row_no)] : nullptr;
@@ -889,6 +1110,17 @@ void draw(const View &v, float dt)
             break;
         }
         case Kind::choice: draw_choice(xr, cy, r, r.get(v), is_focused, on, idx, k); break;
+        case Kind::stepper: {
+            float w = 380;
+            int x = r.get(v), n = r.count(v);
+            Color edge = is_focused ? kAccent : kDim;
+            ui::text(ui::semibold, 30, xr - w + 10, cy - 2, "\xE2\x80\xB9", F(x > 0 ? edge : ui::alpha(kDim, 0.25f)),
+                     ui::center);
+            ui::text(ui::semibold, 30, xr - 10, cy - 2, "\xE2\x80\xBA", F(x < n - 1 ? edge : ui::alpha(kDim, 0.25f)),
+                     ui::center);
+            ui::text(ui::semibold, 23, xr - w / 2, cy, r.text(v).c_str(), F(kInk), ui::center);
+            break;
+        }
         case Kind::slider: {
             float target = float(r.get(v));
             if (!parts_known)
@@ -910,10 +1142,15 @@ void draw(const View &v, float dt)
         draw_stats(v, kRowsY + 3 * kRowPitch + 24);
     if (page_no == kSound)
         draw_sound_card(v, kRowsY + float(page.rows.size()) * kRowPitch + 14);
+    if (page_no == kLevels)
+        draw_levels_card(v, kRowsY + float(page.rows.size()) * kRowPitch + 14);
     if (page_no == kSave || page_no == kLoad)
         draw_slot_detail(v, page.rows[size_t(in_rows ? row_no : 0)]);
     if (page_no == kControls) {
-        float hy = kRowsY + kRowPitch + 20, kx = row_right() - 28;
+        int first = 0;
+        while (page.rows[size_t(first)].kind != Kind::info)
+            first++;
+        float hy = kRowsY + float(first) * kRowPitch + 14, kx = row_right() - 28;
         small_caps(kx - 300, hy, "CONTROLLER", kFaint, ui::right);
         small_caps(kx, hy, "KEYBOARD", kFaint, ui::right);
     }
@@ -940,7 +1177,8 @@ void draw(const View &v, float dt)
         const char *what = "Select";
         if (focused_row && focused_row->kind == Kind::slot)
             what = focused_row->req.cmd == Cmd::load ? "Load" : "Save here";
-        else if (focused_row && (focused_row->kind == Kind::choice || focused_row->kind == Kind::slider))
+        else if (focused_row && (focused_row->kind == Kind::choice || focused_row->kind == Kind::slider ||
+                                 focused_row->kind == Kind::stepper))
             what = "Change";
         hints.push_back({{Button::south}, {"Enter"}, what});
         hints.push_back({{Button::east}, {"Esc"}, in_rows ? "Back" : "Resume"});

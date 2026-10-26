@@ -1,18 +1,16 @@
 #!/bin/sh
 # Wraps the built game into a double-clickable macOS app.
-#   make_mac_app.sh <jp2 binary> <disk image> <output .app>
-# The disk image is copied inside the app, so the app is for this Mac only:
-# don't share it.
+#   make_mac_app.sh <jp2 binary> <output .app> [version]
+# The app carries no disk: on first run it asks for the player's own.
 set -e
 bin="$1"
-adf="$2"
-app="$3"
+app="$2"
+version="${3:-1.0.0}"
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/jp2"
-cp "$adf" "$app/Contents/Resources/jp2.adf"
-cat > "$app/Contents/Info.plist" <<'EOF'
+cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -28,7 +26,9 @@ cat > "$app/Contents/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1</string>
+    <string>$version</string>
+    <key>CFBundleVersion</key>
+    <string>$version</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>

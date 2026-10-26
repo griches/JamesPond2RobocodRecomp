@@ -17,6 +17,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <cstdlib>
 #include <vector>
 
 using namespace jp2;
@@ -41,6 +42,7 @@ struct Loaded {
     std::vector<Handler> table;    // by (pc - base) / 2
     std::vector<uint8_t> len;      // instruction length, 0 = none
     std::vector<uint8_t> ok;       // memory still holds those bytes
+    std::vector<uint8_t> foreign;  // this disk's bytes differ from the build's: never translated
     std::vector<int32_t> chunk;    // which chunk the instruction is in
 };
 static std::vector<Loaded> images;
@@ -66,7 +68,7 @@ static void revalidate(int page)
         for (uint32_t a = from; a < to; a += 2) {
             uint32_t i = (a - b) >> 1;
             uint8_t n = im.len[i];
-            if (!n)
+            if (!n || im.foreign[i])
                 continue;
             uint8_t now = std::memcmp(&ram[a], &im.bytes[a - b], n) == 0;
             if (now != im.ok[i]) {
@@ -107,22 +109,34 @@ bool recomp_init(std::string *note)
     chunks.clear();
     std::memset(cand_n, 0, sizeof cand_n);
     std::memset(code_bits, 0, sizeof code_bits);
-    int unusable = 0;
+    int unusable = 0, differ = 0, total = 0;
     std::unordered_map<Handler, int> chunk_of;
+    // Tests: JP2_TEST_FOREIGN=<hex pc> treats the 256 bytes from there as if
+    // this disk's code differed.
+    uint32_t test_lo = 1, test_hi = 0;
+    if (const char *t = std::getenv("JP2_TEST_FOREIGN")) {
+        test_lo = uint32_t(std::strtoul(t, nullptr, 16));
+        test_hi = test_lo + 0x100;
+    }
     for (int i = 0; i < code_image_count; i++) {
         const CodeImage &ci = code_images[i];
         Loaded im;
         im.ci = &ci;
         std::string err;
         bool ok = ci.file < 0 ? disk::main_program(im.bytes, &err) : disk::file(ci.file, im.bytes);
-        if (!ok || im.bytes.size() != ci.size || disk::crc32(im.bytes.data(), im.bytes.size()) != ci.crc) {
+        if (!ok) {
             unusable++;
             continue;
         }
+        // Another release or crack: check each instruction against what it
+        // was translated from rather than giving up on the whole image.
+        bool exact = im.bytes.size() == ci.size && disk::crc32(im.bytes.data(), im.bytes.size()) == ci.crc;
+        im.bytes.resize(ci.size, 0);
         size_t slots = ci.size / 2 + 1;
         im.table.assign(slots, nullptr);
         im.len.assign(slots, 0);
         im.ok.assign(slots, 0);
+        im.foreign.assign(slots, 0);
         im.chunk.assign(slots, -1);
         for (size_t e = 0; e < ci.count; e++) {
             const CodeEntry &ce = ci.entries[e];
@@ -136,6 +150,11 @@ bool recomp_init(std::string *note)
             c.p0 = std::min(c.p0, ce.pc >> 8);
             c.p1 = std::max(c.p1, (ce.pc + ce.len - 1) >> 8);
             c.bad++;   // nothing is trusted until checked
+            total++;
+            if ((!exact && code_sum(&im.bytes[o], ce.len) != ce.sum) || (ce.pc >= test_lo && ce.pc < test_hi)) {
+                im.foreign[o >> 1] = 1;
+                differ++;
+            }
             im.table[o >> 1] = ce.fn;
             im.len[o >> 1] = uint8_t(ce.len);
             im.chunk[o >> 1] = it->second;
@@ -157,11 +176,12 @@ bool recomp_init(std::string *note)
     }
     for (int p = 0; p < kPages; p++)
         page_dirty[p] = cand_n[p] ? 1 : 0;
-    if (unusable) {
-        char buf[160];
+    if (unusable || differ) {
+        char buf[200];
         std::snprintf(buf, sizeof buf,
-                      "%d of %d translated code images don't match this disk; that code runs interpreted", unusable,
-                      code_image_count);
+                      "this disk differs from the one the code was translated from: %d of %d images missing, %d of %d "
+                      "instructions differ; those run interpreted",
+                      unusable, code_image_count, differ, total);
         *note = buf;
     }
     return !images.empty();

@@ -6,3 +6,6 @@ build/
 *.ipf
 .DS_Store
 __pycache__/
+.deps/
+dist/
+klog/

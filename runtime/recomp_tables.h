@@ -10,8 +10,20 @@ namespace jp2 {
 struct CodeEntry {
     uint32_t pc;
     uint32_t len;
-    Handler fn;   // the chunk function that has an entry label for pc
+    Handler fn;     // the chunk function that has an entry label for pc
+    uint32_t sum;   // code_sum of the bytes it was translated from
 };
+
+// A checksum of an instruction's bytes (FNV-1a), so a disk whose code differs
+// here and there (another release, another crack) still runs translated
+// wherever it matches.
+inline uint32_t code_sum(const uint8_t *p, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++)
+        h = (h ^ p[i]) * 16777619u;
+    return h;
+}
 
 struct CodeImage {
     int file;            // -1 = main program, else the disk file it came from

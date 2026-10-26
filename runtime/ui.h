@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 
 #include <cstdint>
+#include <string>
 
 namespace ui {
 
@@ -31,7 +32,7 @@ constexpr int game = 0xEA28, save = 0xE161, load = 0xE28E, display = 0xE333, sou
               controls = 0xF135, info = 0xE88E, done = 0xE86C, play = 0xE037, home = 0xE88A, quit = 0xE9BA,
               star = 0xE838, heart = 0xE87D, bolt = 0xEA0B, add = 0xE145, clock = 0xE192, eye = 0xE417,
               shield = 0xE9E0, infinite = 0xEB3D, flight = 0xE539, skip = 0xE044, music = 0xE3A1,
-              keyboard = 0xE312, wave = 0xE1B8, monitor = 0xEF5B, joystick = 0xF5EE;
+              keyboard = 0xE312, wave = 0xE1B8, monitor = 0xEF5B, joystick = 0xF5EE, folder = 0xE2C8;
 }
 
 bool init(SDL_Renderer *ren);
@@ -55,5 +56,14 @@ float text_width(Font f, float size, const char *s, float tracking = 0);
 void icon(int codepoint, float size, float cx, float cy, Color c);   // centred on (cx, cy)
 
 void image(SDL_Texture *t, float x, float y, float w, float h, float alpha = 1);
+
+// What the renderer has drawn so far this frame, as a PNG; a 4K screen's at
+// half size. Written on its own thread: a console's storage busy with other
+// transfers once took a minute over one, and the game waited.
+void save_screen(SDL_Renderer *ren, const std::string &path);
+// Development, on the PlayStation 5: true once when a file named devloop-shot
+// has appeared in the title's folder (FTP one there to ask for a screenshot).
+bool console_shot_asked();
+void image_rounded(SDL_Texture *t, float x, float y, float w, float h, float radius, float alpha = 1);
 
 } // namespace ui

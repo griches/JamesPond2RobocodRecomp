@@ -60,6 +60,7 @@ struct PlayfieldStart {
     int line;             // -1 if no bitplanes were shown this frame
     uint32_t bpl[6];
     uint16_t bplcon0, bplcon1, diwstrt, diwstop, ddfstrt, ddfstop;
+    int16_t bpl1mod, bpl2mod;
 };
 extern PlayfieldStart playfield_start;
 
@@ -78,9 +79,18 @@ inline uint16_t chip16(uint32_t a)
     a &= (kRamSize - 1) & ~1u;
     return uint16_t(ram[a] << 8 | ram[a + 1]);
 }
+// A word the blit about to run must not write (0: none), set by the game
+// layer from blit_seen() for one blit at a time.
+extern uint32_t blit_keep;
+// JP2_WATCH=addr (development): report every write to that word.
+extern uint32_t data_watch;
+extern int watch_frame;
+void data_written(uint32_t a, uint16_t v, bool blitter);
 inline void chip16_write(uint32_t a, uint16_t v)
 {
     a &= (kRamSize - 1) & ~1u;
+    if (data_watch && a == data_watch)
+        data_written(a, v, true);
     touch(a);
     touch(a + 1);
     ram[a] = uint8_t(v >> 8);
@@ -159,6 +169,10 @@ void set_audio_output(const AudioOutput &o);
 // played round and round through the current output settings.
 void audio_preview_begin();
 int audio_preview_take(float *out, int frames);
+// Told whenever a channel starts playing a sample (its address and length
+// in words), so the host can react to particular sounds.
+using SampleStart = void (*)(int channel, uint32_t lc, uint16_t len);
+void paula_on_start(SampleStart fn);
 // Interleaved stereo float samples produced since the last call.
 int audio_take(float *out, int max_frames);
 

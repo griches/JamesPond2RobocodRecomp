@@ -1,6 +1,8 @@
 #include "wide.h"
 
 #include "amiga.h"
+#include "disk.h"
+#include "png.h"
 #include "state.h"
 
 #include <algorithm>
@@ -28,6 +30,8 @@ constexpr uint32_t kObjMirrorX = 0x143E;
 constexpr uint32_t kObjFlash = 0x1424;              // >0 solid, <0 cut out
 constexpr uint32_t kObjLayer = 0x143A;              // the record's layer tag
 constexpr uint32_t kNoSprites = 0x5F2;              // set: no objects become sprites
+constexpr uint32_t kStar = 0x2AF4E;                 // first frame of the star an enemy bursts into
+constexpr uint32_t kStarCrc = 0x63AC0E5A;           // of its 512 bytes, in every level
 
 // One object the game asked to draw, in world pixels.
 struct Obj {
@@ -112,7 +116,14 @@ struct Geometry {
     int h0, v0, w;       // window in display coordinates
     int par_x0, par_y0;  // parallax image position at window (0, 0)
     bool par_known;      // false: draw no parallax layer
+    bool flip;           // shown upside down: window row y is world row camy + 207 - y
+    int period;          // no place in the image, but plane 5 repeats every this many columns
 };
+
+// The upside-down levels show their bitplanes bottom up (a negative modulo
+// steps each line back a row); the parallax image is read that way too.
+bool par_flip;
+int par_row(int y0, int y) { return par_flip ? y0 - y : y0 + y; }
 
 // Where the parallax image sits when no blit says so: a level or room that
 // never redraws the layer (it may still flip between two buffers), or a save
@@ -127,6 +138,16 @@ struct Found {
 };
 Found found[4];
 int found_next, frames_seen;
+// After a search finds nothing, none runs again before this frame. Unlike a
+// buffer's own retry_frame it outlives forget_found(): a layer that is not
+// in the image (the tube rooms) would otherwise be searched for with every
+// blit, the whole image each time, and the game slows down as it scrolls.
+int search_after;
+// The search through the whole image covers a band of its rows a frame (all
+// at once took over 10 ms on a Steam Deck); the next band starts here. Just
+// after a load it covers the lot, so the first picture has its layer.
+int scan_row;
+bool scan_all;
 // Where the layer was last placed (no scroll delay), to search near first.
 int hint_x, hint_y;
 bool hint_ok;
@@ -147,8 +168,64 @@ bool layer_matches(int h0, int v0, int w, int x0, int y0)
     int bad = 0, n = 0;
     for (int y = 3; y < kHeight; y += 23)
         for (int x = 5; x < w; x += 37, n++)
-            bad += parallax_bit(x0 + x, y0 + y) != shown_bit5(h0, v0, x, y);
+            bad += parallax_bit(x0 + x, par_row(y0, y)) != shown_bit5(h0, v0, x, y);
     return bad * 10 <= n;
+}
+
+// How many of a fine grid of window pixels disagree with the image placed at (px, py).
+int mismatches(int h0, int v0, int w, int px, int py, int *count)
+{
+    int bad = 0, n = 0;
+    for (int y = 1; y < kHeight; y += 4)
+        for (int x = 2; x < w; x += 5, n++)
+            bad += parallax_bit(px + x, par_row(py, y)) != shown_bit5(h0, v0, x, y);
+    *count = n;
+    return bad;
+}
+
+// The smallest number of columns after which the window's bitplane 5 repeats
+// itself exactly (a layer built from a tile, as in the tube rooms), or 0.
+int screen_period(int h0, int v0, int w)
+{
+    for (int p = 16; p <= w / 2; p += 16) {
+        int bad = 0, n = 0;
+        for (int y = 0; y < kHeight; y += 3)
+            for (int x = 0; x + p < w; x += 3, n++)
+                bad += shown_bit5(h0, v0, x, y) != shown_bit5(h0, v0, x + p, y);
+        if (bad * 500 <= n)
+            return p;
+    }
+    return 0;
+}
+
+// Keeps a found position on the layer as it scrolls: the best fit within three
+// pixels of where the layer was last frame (in either buffer; a double-buffered
+// layer has moved twice since this buffer was last shown) or of this buffer's
+// own last place. False when nothing near fits any more.
+// Where the picture repeats, several places fit equally well: ties go to the
+// one nearest last frame's place, then this buffer's own, so the two buffers
+// agree and smooth motion doesn't slide the layer between equal places.
+bool follow_parallax(int h0, int v0, int w, int delay, Found *f)
+{
+    int best = 1 << 30, best_far = 0, bx = 0, by = 0, n = 1;
+    int centres[2][2] = {{hint_x, hint_y}, {f->base_x, f->y0}};
+    for (int c = hint_ok ? 0 : 1; c < 2; c++)
+        for (int dy = -3; dy <= 3; dy++)
+            for (int dx = -3; dx <= 3; dx++) {
+                int px = (centres[c][0] - delay + dx) & 511, py = (centres[c][1] + dy) & 255;
+                int m = mismatches(h0, v0, w, px, py, &n), far = dx * dx + dy * dy;
+                if (m < best || (m == best && far < best_far)) {
+                    best = m;
+                    best_far = far;
+                    bx = px;
+                    by = py;
+                }
+            }
+    if (best * 10 > n)
+        return false;
+    f->base_x = bx + delay;
+    f->y0 = by;
+    return true;
 }
 
 bool recover_parallax(int h0, int v0, int w, int delay, Found *f)
@@ -170,26 +247,36 @@ bool recover_parallax(int h0, int v0, int w, int delay, Found *f)
     // Rarer bits first: a wrong position fails on them soonest.
     bool rare = set * 2 < n;
     std::stable_partition(pts.begin(), pts.end(), [&](const Pt &p) { return p.bit == int(rare); });
+    // A wrong place misses about half the rare bits, so a few misses among the
+    // first samples end the check early.
     auto fits = [&](int px, int py) {
         int bad = 0;
         for (int i = 0; i < n; i++)
-            if (parallax_bit(px + pts[i].x, py + pts[i].y) != pts[i].bit && ++bad > n / 50)
+            if (parallax_bit(px + pts[i].x, par_row(py, pts[i].y)) != pts[i].bit && ++bad > (i < 24 ? 3 : n / 50))
                 return false;
         f->base_x = px + delay;
         f->y0 = py;
         return true;
     };
     // The layer moves a few pixels a frame, so look near where it was first.
+    // A fit is only near the place (the samples are sparse): settle it on the best.
     if (hint_ok)
         for (int r = 0; r <= 32; r++)
             for (int dy = -r; dy <= r; dy++)
                 for (int dx = -r; dx <= r; dx += (std::abs(dy) == r ? 1 : 2 * r))
-                    if (fits((hint_x - delay + dx) & 511, (hint_y + dy) & 255))
-                        return true;
-    for (int py = 0; py < 256; py++)
+                    if (fits((hint_x - delay + dx) & 511, (hint_y + dy) & 255)) {
+                        scan_row = 0;
+                        return follow_parallax(h0, v0, w, delay, f);
+                    }
+    int end = scan_all ? 256 : std::min(scan_row + 32, 256);
+    scan_all = false;
+    for (int py = scan_row; py < end; py++)
         for (int px = 0; px < 512; px++)
-            if (fits(px, py))
-                return true;
+            if (fits(px, py)) {
+                scan_row = 0;
+                return follow_parallax(h0, v0, w, delay, f);
+            }
+    scan_row = end % 256;
     return false;
 }
 
@@ -211,6 +298,7 @@ bool geometry(Geometry *g)
         return false;
     if ((ps.bplcon0 & 0x7000) != 0x5000 || (ps.bplcon0 & 0x8C00))   // 5 planes, lowres, no HAM/DPF
         return false;
+    g->period = 0;
     g->h0 = ps.diwstrt & 0xFF;
     g->v0 = ps.diwstrt >> 8;
     g->w = ((ps.diwstop & 0xFF) | 0x100) - g->h0;
@@ -218,7 +306,11 @@ bool geometry(Geometry *g)
         return false;
     int first = 2 * (ps.ddfstrt & 0xFC) + 17;          // display column of the first fetched pixel
     int delay = ps.bplcon1 & 15;                       // plane 5 is odd: playfield 1 scroll
-    const Params *pp = blit_for_shown();
+    int fetch = (((ps.ddfstop & 0xFC) - (ps.ddfstrt & 0xFC)) / 8 + 1) * 2;   // bytes a line, lowres
+    g->flip = ps.bpl1mod + fetch < 0;
+    par_flip = g->flip;
+    // The blit position is worked out for a buffer read top down.
+    const Params *pp = g->flip ? nullptr : blit_for_shown();
     if (pp) {
         uint32_t off = pp->par_a - kParallax;
         int lead = int(int32_t(ps.bpl[4] - pp->par_d)) * 8;
@@ -232,17 +324,19 @@ bool geometry(Geometry *g)
     }
     if (!pp) {
         Found &f = found_for(ps.bpl[4]);
-        if (f.valid && !layer_matches(g->h0, g->v0, g->w, f.base_x - delay, f.y0))
+        if (f.valid && !follow_parallax(g->h0, g->v0, g->w, delay, &f))
             f.valid = false;
-        if (!f.valid && frames_seen >= f.retry_frame) {
+        if (!f.valid && frames_seen >= f.retry_frame && frames_seen >= search_after) {
             f.valid = recover_parallax(g->h0, g->v0, g->w, delay, &f);
-            if (!f.valid)
-                f.retry_frame = frames_seen + 25;
+            if (!f.valid && scan_row == 0)   // the whole image searched: wait before another go
+                f.retry_frame = search_after = frames_seen + 25;
         }
-        // Not found: draw the margins without the layer rather than drop widescreen.
+        // Not found: draw the margins without the layer rather than drop widescreen,
+        // unless it repeats across the window, when the margins can repeat it too.
         g->par_x0 = f.valid ? f.base_x - delay : 0;
         g->par_y0 = f.valid ? f.y0 : 0;
         g->par_known = f.valid;
+        g->period = f.valid ? 0 : screen_period(g->h0, g->v0, g->w);
     }
     if (g->par_known) {
         hint_x = g->par_x0 + delay;
@@ -260,13 +354,13 @@ bool geometry(Geometry *g)
 // (BPLCON2 = 0) they only show where the playfield is colour 0.
 template <class Allowed>
 void draw_obj(const Obj &o, int wx, int wy, uint8_t *idx, int width, int height, int ox, Allowed allowed,
-              bool as_sprite = false, bool behind = true, int rows = -1)
+              bool as_sprite = false, bool behind = true, int rows = -1, bool flip = false)
 {
     uint32_t plane = o.column ? 2 : uint32_t(o.w) * 2 * uint32_t(o.h);
     if (rows < 0 || !o.column)
         rows = o.h;
     for (int r = 0; r < rows; r++) {
-        int y = wy + r;
+        int y = flip ? height - 1 - (wy + r) : wy + r;
         if (y < 0 || y >= height)
             continue;
         for (int c = 0; c < o.w * 16; c++) {
@@ -392,10 +486,19 @@ void blit_seen()
 {
     const uint16_t *r = regs;
     uint16_t con0 = r[0x040 >> 1], size = r[0x058 >> 1];
-    if ((con0 & 0x0FFF) != 0x09F0 || (size & 63) != 19 || building.par)
+    if ((con0 & 0x0FFF) != 0x09F0 || (size & 63) != 19)
         return;
     uint32_t a = uint32_t(r[0x050 >> 1]) << 16 | r[0x052 >> 1];
     if (a < kParallax || a >= kParallax + kParallaxBytes)
+        return;
+    // The game draws the layer into the screen buffer from one word before
+    // it, and the screen buffer follows the image, so the first word lands on
+    // the image's last word: a stray dash then shows wherever the image's
+    // bottom right corner comes round (an original bug). The word is never
+    // shown on screen; keep the image's own.
+    if ((uint32_t(r[0x054 >> 1]) << 16 | r[0x056 >> 1]) == kParallax + kParallaxBytes - 2)
+        blit_keep = kParallax + kParallaxBytes - 2;
+    if (building.par)
         return;
     // The first of the frame's parallax blits gives the image's position;
     // a second one only wraps the bottom of the image round to the top.
@@ -488,11 +591,31 @@ void save_state(amiga::StateIO &s)
         for (Params &p : last_into)
             p = Params{};
         hint_ok = false;
+        search_after = scan_row = 0;
+        scan_all = true;
+        repair_parallax();
     }
+}
+
+// Saves made before blit_keep may carry the stray word in the image. The
+// game builds the image from tiles written twice, 256 pixels apart, so when
+// the two halves agree everywhere else the word's twin gives it back.
+void repair_parallax()
+{
+    constexpr uint32_t last = kParallax + kParallaxBytes - 2, twin = last - 32;
+    if (chip16(last) == chip16(twin))
+        return;
+    for (uint32_t at = kParallax; at < last; at += 2)
+        if ((at - kParallax) % 64 < 32 && at != twin && chip16(at) != chip16(at + 32))
+            return;
+    chip16_write(last, chip16(twin));
 }
 
 static int extra_px;
 void set_view_extra(int pixels) { extra_px = pixels; }
+
+static bool available = true;
+void set_available(bool on) { available = on; }
 int view_extra() { return extra_px; }
 
 void view_extents(int cam_x, int *left, int *right)
@@ -507,6 +630,9 @@ void view_extents(int cam_x, int *left, int *right)
         *left = 2 * e - *right;
     }
 }
+
+static int stars_last, star_count;
+int bursts() { return star_count; }
 
 void frame_done()
 {
@@ -538,6 +664,14 @@ void frame_done()
         slot->par_d = old.par_d;
         slot->par_shift = old.par_shift;
     }
+    // Enemies bursting into a star, for the pad: stars in their first frame
+    // that weren't there last frame.
+    int stars = 0;
+    for (const Obj &o : building.objs)
+        stars += o.gfx == kStar;
+    if (stars > stars_last && disk::crc32(&ram[kStar], 512) == kStarCrc)
+        star_count += stars - stars_last;
+    stars_last = stars;
     for (int k = kHist - 1; k > 0; k--)
         hist[k] = hist[k - 1];
     hist[0] = building;
@@ -571,10 +705,51 @@ int lerp(int a, int b, float alpha, int limit = 48)
     return int(std::lround(a + (b - a) * alpha));
 }
 
+// Where the game puts the parallax image for the camera at x: its table at
+// $A3C0, by the level's mode in $ABE. Half the camera, a quarter, one and a
+// half times; the other modes move it on their own (drifting clouds, rising
+// bubbles, animations) or not at all.
+int par_for_cam(int x)
+{
+    switch (chip16(0xABE)) {
+    case 1: return x >> 1;
+    case 3: return x >> 2;
+    case 10: return x + (x >> 1);
+    default: return 0;
+    }
+}
+
+// How wide the parallax picture is before it repeats across: 64, 128 or 256.
+// Positions that far apart look the same, so the two screen buffers may be
+// placed a whole repeat apart, and blending must treat them as one.
+int par_period()
+{
+    static int frame = -1, period = 256;
+    if (frame == frames_seen)
+        return period;
+    frame = frames_seen;
+    for (int p : {64, 128}) {
+        int same = 0;
+        for (uint32_t r = 0; r < 256; r++) {
+            uint32_t row = kParallax + r * 64;
+            bool eq = true;
+            for (uint32_t i = 0; i < 32 && eq; i += 2)
+                eq = chip16(row + i) == chip16(row + uint32_t(p / 8) + i);
+            same += eq;
+        }
+        if (same >= 250) {
+            period = p;
+            return period;
+        }
+    }
+    period = 256;
+    return period;
+}
+
 int lerp_wrap(int a, int b, float alpha, int period)
 {
     int d = ((b - a) % period + period + period / 2) % period - period / 2;
-    if (std::abs(d) > 48)
+    if (std::abs(d) > 48 || alpha >= 1)
         return b;
     return int(std::lround(a + d * alpha));
 }
@@ -604,6 +779,8 @@ const Obj *match(const Obj &o, const std::vector<Obj> &prev)
 
 bool render(uint32_t *out, int width, float alpha, bool full)
 {
+    if (!available)
+        return false;
     if (!shown_cur.valid || width < shown_cur.g.w || width > kMaxWidth)
         return false;
     const Shown &cu = shown_cur;
@@ -614,7 +791,6 @@ bool render(uint32_t *out, int width, float alpha, bool full)
         alpha = 1;
     int camx = pv ? lerp(pv->camx, cu.camx, alpha) : cu.camx;
     int camy = pv ? lerp(pv->camy, cu.camy, alpha) : cu.camy;
-    int parx = pv ? lerp_wrap(pv->g.par_x0, g.par_x0, alpha, 512) : g.par_x0;
     int pary = pv ? lerp_wrap(pv->g.par_y0, g.par_y0, alpha, 256) : g.par_y0;
     // Keep the wide view inside the level: at its ends the view stops at the
     // edge and the game's own window slides across instead.
@@ -625,6 +801,28 @@ bool render(uint32_t *out, int width, float alpha, bool full)
     int shift = view_left - (camx - extra);
     if (shift)
         full = true;   // the game's own picture is no longer where it was
+    // The parallax goes with the view, not with the game's camera: while the
+    // view is held at a level's end, the camera moving on behind it mustn't
+    // move the background (it would drift the wrong way, then catch up). So
+    // each tick's position is taken for its view, and only that is blended:
+    // blending the game's position and the camera apart and rounding each
+    // could step it back a pixel between ticks.
+    auto view_cam = [&](int cam) {
+        int left = cam - extra;
+        if (level_w >= width)
+            left = std::clamp(left, 0, level_w - width);
+        return left + extra;
+    };
+    auto par_for_view = [&](const Shown &s) {
+        return s.g.par_x0 + par_for_cam(view_cam(s.camx)) - par_for_cam(s.camx);
+    };
+    // Blend on the picture's repeat (the game keeps the position modulo 256,
+    // and some pictures repeat sooner): a wrap, or the two buffers placed a
+    // whole repeat apart, is then a step like any other.
+    int parx = pv ? lerp_wrap(par_for_view(*pv), par_for_view(cu), alpha, par_period()) : par_for_view(cu);
+    if (std::getenv("JP2_PARVIEW"))
+        std::fprintf(stderr, "parview: alpha %.2f cam %d shift %d image column at the view's left %d\n", alpha, camx,
+                     shift, parx - extra);
 
     static uint8_t idx[kMaxWidth * kHeight];
     auto drawn_here = [&](int x) { return full || x < extra || x >= extra + g.w; };
@@ -633,8 +831,11 @@ bool render(uint32_t *out, int width, float alpha, bool full)
             if (!drawn_here(x))
                 continue;
             int wx = x - extra + shift;   // window column
-            int par = g.par_known ? parallax_bit(parx + wx, pary + y) : 0;
-            idx[size_t(y) * width + x] = uint8_t(tile_index(cu.cam, camx + wx + tile_dx, camy + y + tile_dy) | par << 4);
+            int wy = g.flip ? kHeight - 1 - y : y + tile_dy;
+            int par = g.par_known ? parallax_bit(parx + (x - extra), g.flip ? pary - y : pary + y)
+                      : g.period ? shown_bit5(g.h0, g.v0, ((wx % g.period) + g.period) % g.period, y)
+                                 : 0;
+            idx[size_t(y) * width + x] = uint8_t(tile_index(cu.cam, camx + wx + tile_dx, camy + wy) | par << 4);
         }
     // Objects are drawn layer by layer as the game does (4, 3, 2, 1, then 0
     // on top); the ones it shows as sprites come last, behind anything drawn.
@@ -656,7 +857,7 @@ bool render(uint32_t *out, int width, float alpha, bool full)
                         rows = lerp(p->y + p->h, o.y + o.h, alpha, 64) - oy;
                 }
             draw_obj(o, ox - camx - shift + obj_dx, oy - camy + obj_dy, idx, width, kHeight, extra, drawn_here,
-                     pass == 1, behind, rows);
+                     pass == 1, behind, rows, g.flip);
         }
     for (int y = 0; y < kHeight; y++) {
         int line = g.v0 + y - kFbY0;
@@ -717,9 +918,31 @@ void flicker_check()
         }
     have = true;
     std::printf("flicker: game plane-5 changed %5.2f%%  redraw changed %5.2f%%  redraw vs game %5.2f%%  bpl5 %06X blit %d "
-                "origin %d,%d\n",
+                "origin %d,%d  frame %d\n",
                 100.0 * game_changed / n, 100.0 * mine_changed / n, 100.0 * apart / n, playfield_start.bpl[4],
-                blit_for_shown() ? 1 : 0, g.par_x0, g.par_y0);
+                blit_for_shown() ? 1 : 0, g.par_x0, g.par_y0, frames_seen);
+}
+
+// The game's window, the redraw of it, and where they differ (red), stacked.
+void diff_png(const char *path)
+{
+    if (!shown_cur.valid)
+        return;
+    Geometry g = shown_cur.g;
+    static uint32_t mine[320 * kHeight], out[320 * kHeight * 3];
+    if (!render(mine, g.w, 1.0f, true))
+        return;
+    for (int y = 0; y < kHeight; y++)
+        for (int x = 0; x < g.w; x++) {
+            int line = g.v0 + y - kFbY0;
+            uint32_t game = framebuffer[line * kFbW + (g.h0 + x - kFbX0)];
+            bool hud = sprite_buffer[line * kFbW + (g.h0 + x - kFbX0)] & 0x80;
+            out[y * g.w + x] = game;
+            out[(kHeight + y) * g.w + x] = mine[y * g.w + x];
+            uint32_t grey = 0xFF000000u | ((game >> 2) & 0x3F3F3F);
+            out[(2 * kHeight + y) * g.w + x] = hud ? 0xFF003000u : mine[y * g.w + x] != game ? 0xFFFF2020u : grey;
+        }
+    write_png(path, out, g.w, kHeight * 3, g.w);
 }
 
 void self_check()
@@ -759,8 +982,11 @@ void self_check()
     for (int y = 0; y < kHeight; y += 2)
         for (int x = 0; x < g.w; x += 2) {
             int real = index_buffer[(g.v0 + y - kFbY0) * kFbW + (g.h0 + x - kFbX0)];
-            tiles_bad += (real & 15) != tile_index(c, c.camx + x + tile_dx, c.camy + y + tile_dy);
-            par_bad += (real >> 4 & 1) != parallax_bit(g.par_x0 + x, g.par_y0 + y);
+            tiles_bad += (real & 15) != tile_index(c, c.camx + x + tile_dx, c.camy + (g.flip ? kHeight - 1 - y : y + tile_dy));
+            int par = g.par_known ? parallax_bit(g.par_x0 + x, g.flip ? g.par_y0 - y : g.par_y0 + y)
+                      : g.period ? shown_bit5(g.h0, g.v0, x % g.period, y)
+                                 : 0;
+            par_bad += (real >> 4 & 1) != par;
             count++;
         }
     // Objects: for each history entry and offset, how many of the object
