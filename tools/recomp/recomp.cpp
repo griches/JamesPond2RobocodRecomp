@@ -89,6 +89,10 @@ void trace(Image &img)
     while (!img.work.empty()) {
         uint32_t pc = img.work.back();
         img.work.pop_back();
+        // Before the entry point is the disk's own loader (a crack's header
+        // on most disks), not the game: the interpreter runs it from the disk.
+        if (pc < disk::kEntry)
+            continue;
         while (img.contains(pc) && !img.code.count(pc)) {
             Insn in = translate(pc, [&](uint32_t a) { return img.word(a); });
             if (in.flow == Insn::INTERP) {
