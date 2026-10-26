@@ -39,5 +39,7 @@ Instructions and help: https://github.com/griches/JamesPond2RobocodRecomp
 TXT
 out="$root/dist/release/JamesPond2-Linux-$version.tar.gz"
 mkdir -p "$(dirname "$out")"
-COPYFILE_DISABLE=1 tar -czf "$out" -C "$work" JamesPond2
+# No macOS metadata: GNU tar would warn about every file's extended attributes
+xattr -cr "$dir" 2>/dev/null || true
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$out" -C "$work" JamesPond2
 echo "$out ($(du -h "$out" | cut -f1), sha256 $(shasum -a 256 "$out" | cut -c1-64))"
