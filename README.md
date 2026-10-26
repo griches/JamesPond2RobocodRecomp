@@ -1,5 +1,9 @@
 # James Pond 2: Codename RoboCod — Recompiled
 
+[![GitHub stars](https://img.shields.io/github/stars/griches/JamesPond2RobocodRecomp?style=flat)](https://github.com/griches/JamesPond2RobocodRecomp/stargazers)
+[![Latest release](https://img.shields.io/github/v/release/griches/JamesPond2RobocodRecomp)](https://github.com/griches/JamesPond2RobocodRecomp/releases/latest)
+[![Licence](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSE)
+
 A native version of the Amiga classic *James Pond 2: Codename RoboCod*
 (Millennium, 1991) for **Windows**, **macOS**, **Steam Deck and Linux**, and
 **PlayStation 5**. The game's 68000 code has been translated into C++, so it
