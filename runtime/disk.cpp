@@ -7,15 +7,41 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace disk {
 
 static std::vector<uint8_t> image;
 
 static uint32_t be32(const uint8_t *p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
+// Paths are UTF-8 (SDL's), but Windows' fopen reads them in the local code
+// page: a disk in C:\Users\José\Downloads wouldn't open. (No SDL here: the
+// recompiler reads disks too.)
+static FILE *open_file(const std::string &path, const char *mode)
+{
+#ifdef _WIN32
+    int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (n <= 0)
+        return nullptr;
+    std::vector<wchar_t> wpath(static_cast<size_t>(n));
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), n);
+    wchar_t wmode[8] = {};
+    for (int i = 0; mode[i] && i < 7; i++)
+        wmode[i] = wchar_t(mode[i]);
+    return _wfopen(wpath.data(), wmode);
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
 static bool read_whole(const std::string &path, std::vector<uint8_t> &out)
 {
-    FILE *f = std::fopen(path.c_str(), "rb");
+    FILE *f = open_file(path, "rb");
     if (!f)
         return false;
     std::fseek(f, 0, SEEK_END);
@@ -188,7 +214,7 @@ bool open(const char *path, std::string *error)
 
 bool save_image(const std::string &path)
 {
-    FILE *f = std::fopen(path.c_str(), "wb");
+    FILE *f = open_file(path, "wb");
     if (!f)
         return false;
     bool ok = std::fwrite(image.data(), 1, image.size(), f) == image.size();

@@ -205,29 +205,30 @@ void apply_script(const std::vector<Press> &script, int frame)
     joy = j;
 }
 
+// SDL's files rather than the C library's: on Windows, fopen reads a path in
+// the local code page, not the UTF-8 SDL gives (C:\Users\José\... won't open),
+// and std::rename won't replace a file that's already there.
 bool read_file(const std::string &path, std::vector<uint8_t> &out)
 {
-    FILE *f = std::fopen(path.c_str(), "rb");
+    SDL_IOStream *f = SDL_IOFromFile(path.c_str(), "rb");
     if (!f)
         return false;
-    std::fseek(f, 0, SEEK_END);
-    long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
+    Sint64 n = SDL_GetIOSize(f);
     out.resize(n > 0 ? size_t(n) : 0);
-    bool ok = n > 0 && std::fread(out.data(), 1, out.size(), f) == out.size();
-    std::fclose(f);
+    bool ok = n > 0 && SDL_ReadIO(f, out.data(), out.size()) == out.size();
+    SDL_CloseIO(f);
     return ok;
 }
 
 bool write_file(const std::string &path, const std::vector<uint8_t> &data)
 {
     std::string tmp = path + ".tmp";
-    FILE *f = std::fopen(tmp.c_str(), "wb");
+    SDL_IOStream *f = SDL_IOFromFile(tmp.c_str(), "wb");
     if (!f)
         return false;
-    bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
-    ok = std::fclose(f) == 0 && ok;
-    return ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+    bool ok = SDL_WriteIO(f, data.data(), data.size()) == data.size();
+    ok = SDL_CloseIO(f) && ok;
+    return ok && SDL_RenamePath(tmp.c_str(), path.c_str());
 }
 
 // Saves and settings live with the user's app data, so they outlast rebuilds.
@@ -1426,8 +1427,8 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
             break;
         case menu::Cmd::start_fresh:
             close_menu();
-            std::remove(resume_path().c_str());
-            std::remove((resume_path() + ".thumb").c_str());
+            SDL_RemovePath(resume_path().c_str());
+            SDL_RemovePath((resume_path() + ".thumb").c_str());
             break;
         case menu::Cmd::invincible: set_invincible(r.arg != 0); break;
         case menu::Cmd::infinite_lives:
@@ -1450,8 +1451,8 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
             else
                 write_thumb(resume_path(), present.data(), kViewW, kViewH);
         } else {
-            std::remove(resume_path().c_str());
-            std::remove((resume_path() + ".thumb").c_str());
+            SDL_RemovePath(resume_path().c_str());
+            SDL_RemovePath((resume_path() + ".thumb").c_str());
         }
     };
 
