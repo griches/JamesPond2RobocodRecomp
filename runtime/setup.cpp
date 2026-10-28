@@ -28,6 +28,31 @@ constexpr const char *kConsoleFolder = "/data/homebrew/" JP2_PS5_TITLE_ID;
 constexpr bool kConsole = false;
 constexpr const char *kConsoleFolder = "";
 #endif
+#ifdef __ANDROID__
+// On Android the game can read its own folders and what the system's file
+// picker hands it. One of its folders the player can reach over USB.
+constexpr bool kAndroid = true;
+#else
+constexpr bool kAndroid = false;
+#endif
+
+// That folder: Android/data/<package>/files on the device's shared storage.
+std::string device_folder()
+{
+#ifdef __ANDROID__
+    if (const char *p = SDL_GetAndroidExternalStoragePath())
+        return p;
+#endif
+    return "";
+}
+
+// As a computer sees it over USB.
+std::string device_folder_shown()
+{
+    std::string p = device_folder();
+    size_t at = p.find("/Android/");
+    return at == std::string::npos ? p : p.substr(at + 1);
+}
 
 // ---- looking for disks ---------------------------------------------------------------
 
@@ -216,15 +241,19 @@ void draw(State &st, float dt)
         wrap(kConsole ? std::string("James Pond 2 plays from your own copy of the Amiga disk. Copy a disk image (an "
                                     ".adf, or an .adz or .zip with one inside) into the game's folder, ") +
                             kConsoleFolder + ", over FTP, then choose Look again. This happens only once."
-                      : std::string("James Pond 2 plays from your own copy of the Amiga disk. Choose a disk image (an "
-                                    ".adf, or an .adz or .zip with one inside) or the folder of a WHDLoad install. "
-                                    "It's copied into the game's own folder, so this happens only once."),
+             : kAndroid ? std::string("James Pond 2 plays from your own copy of the Amiga disk. Choose a disk image (an "
+                                      ".adf, or an .adz or .zip with one inside). It's copied into the game's own "
+                                      "folder, so this happens only once.")
+                        : std::string("James Pond 2 plays from your own copy of the Amiga disk. Choose a disk image (an "
+                                      ".adf, or an .adz or .zip with one inside) or the folder of a WHDLoad install. "
+                                      "It's copied into the game's own folder, so this happens only once."),
              23, w - 96);
     for (size_t i = 0; i < intro.size() && i < 3; i++)
         ui::text(ui::regular, 23, px + 48, kIntroY + float(i) * 33, intro[i].c_str(), ui::alpha(kDim, a));
     bool any_found = !st.rows.empty() && st.rows[0].kind == Row::found;
     if (any_found)
-        ui::text(ui::semibold, 15, px + 48, rows_top(st) - 26, kConsole ? "FOUND ON THIS CONSOLE" : "FOUND ON THIS COMPUTER",
+        ui::text(ui::semibold, 15, px + 48, rows_top(st) - 26,
+                 kConsole ? "FOUND ON THIS CONSOLE" : kAndroid ? "FOUND ON THIS DEVICE" : "FOUND ON THIS COMPUTER",
                  ui::alpha(kFaint, a),
                  ui::left, 2.2f);
 
@@ -267,7 +296,9 @@ void draw(State &st, float dt)
     } else {
         std::string note = kConsole ? std::string("FTP is the console's file server, on port 2121 with most homebrew "
                                                   "loaders.")
-                                    : "Or copy a disk image into " + st.hint + ", named disk.adf, and start the game again.";
+                           : kAndroid ? "Or copy a disk image over USB into " + device_folder_shown() +
+                                            ", then choose Look again."
+                                      : "Or copy a disk image into " + st.hint + ", named disk.adf, and start the game again.";
         std::vector<std::string> lines = wrap(note, 21, w - 88 - 40);
         float y0 = fy + (lines.size() > 1 ? 27 : 42);
         ui::icon(icon::info, 24, px + 56, y0, ui::alpha(kFaint, a));
@@ -295,8 +326,13 @@ void build_rows(State &st, const std::vector<std::string> &found)
 {
     st.rows.clear();
     for (const std::string &p : found)
-        st.rows.push_back({icon::save, base_name(p), kConsole ? kConsoleFolder : short_path(folder_of(p)), Row::found, p});
+        st.rows.push_back({icon::save, base_name(p),
+                           kConsole ? kConsoleFolder : kAndroid ? device_folder_shown() : short_path(folder_of(p)),
+                           Row::found, p});
     if (kConsole) {
+        st.rows.push_back({icon::folder, "Look again", "", Row::rescan, ""});
+    } else if (kAndroid) {   // (a WHDLoad folder can't come through the picker: it can be copied in)
+        st.rows.push_back({icon::add, "Choose a disk image\xE2\x80\xA6", "", Row::pick_file, ""});
         st.rows.push_back({icon::folder, "Look again", "", Row::rescan, ""});
     } else {
         st.rows.push_back({icon::add, "Choose a disk image\xE2\x80\xA6", "", Row::pick_file, ""});
@@ -309,6 +345,7 @@ void build_rows(State &st, const std::vector<std::string> &found)
 std::mutex picked_lock;
 std::string picked;
 bool picked_ready;
+bool picker_failed;   // (none on this device: some Android TVs)
 
 void SDLCALL on_picked(void *, const char *const *files, int)
 {
@@ -316,17 +353,52 @@ void SDLCALL on_picked(void *, const char *const *files, int)
     if (files && files[0]) {
         picked = files[0];
         picked_ready = true;
+    } else if (!files) {
+        picker_failed = true;
     }
 }
+
+#ifdef __ANDROID__
+// Android's picker hands back a content:// address, which only SDL can read:
+// the disk reader gets a copy in the game's cache. `name` is the file's name
+// as far as the address tells ("...document/primary%3ADownload%2Fjp2.adf").
+std::string fetch_picked(const std::string &uri, std::string *name)
+{
+    std::string decoded;
+    for (size_t i = 0; i < uri.size(); i++) {
+        if (uri[i] == '%' && i + 2 < uri.size()) {
+            decoded += char(std::strtol(uri.substr(i + 1, 2).c_str(), nullptr, 16));
+            i += 2;
+        } else {
+            decoded += uri[i];
+        }
+    }
+    size_t cut = decoded.find_last_of("/:");
+    *name = cut == std::string::npos ? decoded : decoded.substr(cut + 1);
+    SDL_IOStream *in = SDL_IOFromFile(uri.c_str(), "rb");
+    if (!in)
+        return "";
+    if (SDL_GetIOSize(in) > (64 << 20)) {   // not a disk; don't read a film into memory
+        SDL_CloseIO(in);
+        return "";
+    }
+    size_t size = 0;
+    void *data = SDL_LoadFile_IO(in, &size, true);
+    std::string copy = std::string(SDL_GetAndroidCachePath()) + "/picked-disk";
+    bool ok = data && SDL_SaveFile(copy.c_str(), data, size);
+    SDL_free(data);
+    return ok ? copy : "";
+}
+#endif
 
 } // namespace
 
 std::vector<std::string> scan(TryDisk try_disk)
 {
     Scan sc{{}, 0, 0};
-    if (kConsole) {   // the title's folder, and folders in it
+    if (kConsole || kAndroid) {   // the game's folder, and folders in it
         sc.any_name = true;
-        look("/app0", 1, sc);
+        look(kConsole ? "/app0" : device_folder(), 1, sc);
         sc.any_name = false;
     }
     std::string home = home_path();
@@ -372,11 +444,11 @@ std::string run(SDL_Window *win, SDL_Renderer *ren, TryDisk try_disk, const std:
     SDL_Gamepad *pad = nullptr;
     bool stick_held = false;
     uint64_t last = SDL_GetTicksNS();
-    auto attempt = [&](const std::string &path) -> bool {
+    auto attempt = [&](const std::string &path, const std::string &name = "") -> bool {
         std::string err;
         if (try_disk(path, &err))
             return true;
-        st.message = base_name(path) + ": " + err;
+        st.message = (name.empty() ? base_name(path) : name) + ": " + err;
         return false;
     };
     // Tests: JP2_TEST_DROP=<path> drops that file on the page after a moment.
@@ -399,12 +471,26 @@ std::string run(SDL_Window *win, SDL_Renderer *ren, TryDisk try_disk, const std:
                 if (e.drop.data && attempt(e.drop.data))
                     return e.drop.data;
                 break;
+            // Every pad is open (and stays so for the game); the stick read is
+            // the last used pad's. Android counts a TV's remote as a pad too.
             case SDL_EVENT_GAMEPAD_ADDED:
-                if (!pad)
-                    pad = SDL_OpenGamepad(e.gdevice.which);
+                if (SDL_Gamepad *g = SDL_OpenGamepad(e.gdevice.which); g && !pad)
+                    pad = g;
+                break;
+            case SDL_EVENT_GAMEPAD_REMOVED:
+                if (SDL_Gamepad *g = SDL_GetGamepadFromID(e.gdevice.which)) {
+                    SDL_CloseGamepad(g);
+                    if (g == pad)
+                        pad = nullptr;
+                }
+                break;
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+                if (std::abs(e.gaxis.value) > 20000)
+                    pad = SDL_GetGamepadFromID(e.gaxis.which);
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
                 st.pad = true;
+                pad = SDL_GetGamepadFromID(e.gbutton.which);
                 if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH)
                     act = 1;
                 else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)
@@ -422,7 +508,7 @@ std::string run(SDL_Window *win, SDL_Renderer *ren, TryDisk try_disk, const std:
                     move = 1;
                 else if (!e.key.repeat && (e.key.scancode == SDL_SCANCODE_RETURN || e.key.scancode == SDL_SCANCODE_SPACE))
                     act = 1;
-                else if (!e.key.repeat && e.key.scancode == SDL_SCANCODE_ESCAPE)
+                else if (!e.key.repeat && (e.key.scancode == SDL_SCANCODE_ESCAPE || e.key.scancode == SDL_SCANCODE_AC_BACK))
                     act = -1;
                 break;
             case SDL_EVENT_MOUSE_MOTION:
@@ -475,7 +561,7 @@ std::string run(SDL_Window *win, SDL_Renderer *ren, TryDisk try_disk, const std:
                 st.focus = 0;
                 st.focus_known = false;
                 if (st.rows[0].kind != Row::found)
-                    st.message = std::string("No disk image in ") + kConsoleFolder + " yet.";
+                    st.message = "No disk image in " + (kAndroid ? device_folder_shown() : kConsoleFolder) + " yet.";
                 else
                     st.message.clear();
                 break;
@@ -483,15 +569,35 @@ std::string run(SDL_Window *win, SDL_Renderer *ren, TryDisk try_disk, const std:
             }
         }
         std::string chosen;
+        bool failed = false;
         {
             std::lock_guard<std::mutex> g(picked_lock);
             if (picked_ready) {
                 chosen = picked;
                 picked_ready = false;
             }
+            std::swap(failed, picker_failed);
         }
+        if (failed && kAndroid)
+            st.message = "There's no file picker on this device: copy a disk image over USB into " +
+                         device_folder_shown() + ", then choose Look again.";
+#ifdef __ANDROID__
+        if (!chosen.empty()) {
+            std::string name, copy = fetch_picked(chosen, &name);
+            bool ok = false;
+            if (copy.empty()) {
+                st.message = name + ": can't read it";
+            } else {
+                ok = attempt(copy, name);
+                SDL_RemovePath(copy.c_str());   // kept as disk.adf if it booted
+            }
+            if (ok)
+                return chosen;
+        }
+#else
         if (!chosen.empty() && attempt(chosen))
             return chosen;
+#endif
 
         uint64_t now = SDL_GetTicksNS();
         float dt = std::min(0.1f, float(now - last) / 1e9f);

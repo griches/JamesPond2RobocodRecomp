@@ -13,6 +13,7 @@ reason.
 | `tools/recomp/` | The recompiler. It unpacks the game's main program from the disk, follows its code from the entry point (helped by the recorded coverage in `coverage/`) and writes every instruction as C++ in `generated/code_*.cpp`, with a table of entry points and, for the test, one case per instruction. |
 | `runtime/` | The Amiga around the game: memory, the custom chips (copper, display, blitter, Paula sound), the CIAs, the disk loader, plus the widescreen redraw, the menus and the presentation. |
 | `vendor/musashi/` | A 68000 interpreter. It runs any code the recompiler didn't reach, and is the whole CPU of `jp2-interp`. |
+| `android/` | The Android layer: the manifest, the icon and the APK's build, around SDL3's own Android support. |
 | `ps5/` | The PlayStation 5 layer: SDL3's console drivers, start-up, link and packaging. |
 
 The build makes:
@@ -104,6 +105,39 @@ tools/release/package-linux.sh build-linux/jp2 <version>
 ```
 
 A launcher for full screen is one line, `exec "$(dirname "$0")/jp2" --fullscreen "$@"`.
+
+## Android
+
+The APK is built on the Mac, with the Android SDK's NDK and build tools and no
+Gradle. Like the console's, it compiles the code the Mac build generated, so
+build for macOS first. You need the SDK (Android Studio puts it in
+`~/Library/Android/sdk`) with an NDK, the build tools and the Android 15
+(API 35) platform, and a JDK.
+
+```sh
+ninja -C build/mac                       # generates build/mac/generated
+android/tools/build.sh                   # dist/android/JamesPond2-Android-<version>.apk
+android/tools/device.sh install          # onto the device adb sees
+android/tools/device.sh disk gamedata/jp2.adf
+android/tools/device.sh run 60           # start it and follow its log
+```
+
+The game is `libmain.so`, beside SDL3's `libSDL3.so`, and SDL's own Java
+activity runs it; both come from the SDL checkout the desktop builds use
+(`.deps/SDL-mac-src`, cloned if it isn't there). The APK is for 64-bit ARM
+(`ANDROID_ABIS` adds others, such as `x86_64` for an Intel emulator).
+
+The first build makes the game's signing key, `~/.android/jamespond2.jks`,
+with its password in `~/.android/jamespond2.jks.pass`. Keep both: Android
+updates an installed game only from an APK signed with the same key
+(`JP2_KEYSTORE` names another). Home-screen art made from your own copy of the
+game can go in `gamedata/android-art/` (`icon.png`, and `banner.png` for
+Android TV); without it the build uses the PlayStation 5's `icon0.png` and
+Steam's `capsule.png` from `gamedata/`, if they're there.
+
+`device.sh disk` copies a disk into the game's folder on the device
+(`Android/data/mobi.bouncingball.jamespond2/files`), where the first-run page
+finds it; `device.sh forget` clears the game's data for a first start again.
 
 ## PlayStation 5
 

@@ -24,8 +24,8 @@
 #include "wide.h"
 
 #include <SDL3/SDL.h>
-#ifdef _WIN32
-#include <SDL3/SDL_main.h>   // WinMain for a windowed program, no console
+#if defined(_WIN32) || defined(__ANDROID__)
+#include <SDL3/SDL_main.h>   // WinMain for a windowed program, no console; Android: what SDL's Java side calls
 #endif
 
 #include <algorithm>
@@ -422,6 +422,51 @@ struct Rumble {
         return true;
     }
 };
+
+#ifdef __ANDROID__
+// An Android handheld's own controls seldom have a motor of their own: the
+// device's vibrator is theirs. (SDL lists it as a haptic named so.)
+SDL_Haptic *device_vibrator()
+{
+    static SDL_Haptic *vib = [] {
+        SDL_Haptic *found = nullptr;
+        int n = 0;
+        if (!SDL_InitSubSystem(SDL_INIT_HAPTIC))
+            return found;
+        if (SDL_HapticID *ids = SDL_GetHaptics(&n)) {
+            for (int i = 0; i < n && !found; i++) {
+                const char *name = SDL_GetHapticNameForID(ids[i]);
+                if (!name || std::strcmp(name, "VIBRATOR_SERVICE"))
+                    continue;
+                found = SDL_OpenHaptic(ids[i]);
+                if (found && !SDL_InitHapticRumble(found)) {
+                    SDL_CloseHaptic(found);
+                    found = nullptr;
+                }
+            }
+            SDL_free(ids);
+        }
+        return found;
+    }();
+    return vib;
+}
+#endif
+
+void rumble_pad(SDL_Gamepad *pad, uint16_t lo, uint16_t hi, uint32_t ms)
+{
+#ifdef __ANDROID__
+    if (!SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false)) {
+        if (SDL_Haptic *vib = device_vibrator()) {
+            if (lo || hi)
+                SDL_PlayHapticRumble(vib, float(std::max(lo, hi)) / 65535.0f, ms);
+            else
+                SDL_StopHapticRumble(vib);
+        }
+        return;
+    }
+#endif
+    SDL_RumbleGamepad(pad, lo, hi, ms);
+}
 
 // 16-bit stereo WAV of what the speakers got.
 bool write_wav(const std::string &path, const std::vector<float> &lr)
@@ -1076,6 +1121,19 @@ glyphs::Style pad_style(SDL_Gamepad *pad)
 #endif
 }
 
+// Any pad still open, after the one in use has gone.
+SDL_Gamepad *another_pad()
+{
+    SDL_Gamepad *g = nullptr;
+    int n = 0;
+    if (SDL_JoystickID *ids = SDL_GetGamepads(&n)) {
+        for (int i = 0; i < n && !g; i++)
+            g = SDL_GetGamepadFromID(ids[i]);
+        SDL_free(ids);
+    }
+    return g;
+}
+
 // The last frame through the Picture setting, off screen:
 // "picture,scanlines,width,height[,widescreen]:file.png".
 void picture_shot(const std::string &spec)
@@ -1236,7 +1294,7 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
         SDL_ResumeAudioStreamDevice(audio);
     }
 
-    SDL_Gamepad *pad = nullptr;
+    SDL_Gamepad *pad = another_pad();   // one the first-run page opened (it had the news)
     Joystick keys{}, padj{};
     bool running = true;
     bool want_save = false, want_load = false;
@@ -1253,10 +1311,16 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
     long frames_run = 0;
     menu::View view;
     view.settings = &set;
-    view.style = pad_style(nullptr);
-#ifdef __PROSPERO__
+    view.style = pad_style(pad);
+#if defined(__PROSPERO__) || defined(__ANDROID__)
     view.can_fullscreen = false;   // the console always fills the screen
 #endif
+    auto switch_pad = [&](SDL_JoystickID id) {   // to the pad just used
+        if (SDL_Gamepad *g = SDL_GetGamepadFromID(id); g && g != pad) {
+            pad = g;
+            view.style = pad_style(pad);
+        }
+    };
     struct Held {
         bool on;
         uint64_t next;
@@ -1374,6 +1438,23 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
         }
     };
 
+    // Leaving mid-level: keep the place for next time. Anywhere else (or
+    // without having answered the question at launch), leave things be.
+    auto keep_place = [&]() {
+        if (menu::asking_continue())
+            return;
+        if (wide::playing()) {
+            quick_save(resume_path());
+            if (showing_wide)
+                write_thumb(resume_path(), wide_px.data(), pic_w, wide::kHeight);
+            else
+                write_thumb(resume_path(), present.data(), kViewW, kViewH);
+        } else {
+            std::remove(resume_path().c_str());
+            std::remove((resume_path() + ".thumb").c_str());
+        }
+    };
+
     // Quit mid-level last time: offer to carry on from there.
     SDL_Texture *continue_thumb = nullptr;
     if (SDL_PathInfo info; load_from.empty() && SDL_GetPathInfo(resume_path().c_str(), &info)) {
@@ -1409,20 +1490,40 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
             case SDL_EVENT_QUIT:
                 running = false;
                 break;
+            case SDL_EVENT_DID_ENTER_BACKGROUND:
+                // Android: sent away (Home, a call). The system may close the game
+                // there without a word, so the place and settings are kept now;
+                // back again, it waits in the menu.
+                if (!menu::is_open())
+                    open_menu();
+                settings::save(pref_dir() + "settings.ini", set);
+                written = set;
+                keep_place();
+                break;
+            // Every pad is open, and the one last used is the one read: Android
+            // counts a TV's remote, and some handhelds' own keys, as pads too.
             case SDL_EVENT_GAMEPAD_ADDED:
-                if (!pad) {
-                    pad = SDL_OpenGamepad(e.gdevice.which);
+                if (SDL_Gamepad *g = SDL_OpenGamepad(e.gdevice.which); g && !pad) {
+                    pad = g;
                     view.style = pad_style(pad);
                 }
                 break;
             case SDL_EVENT_GAMEPAD_REMOVED:
-                if (pad && SDL_GetGamepadID(pad) == e.gdevice.which) {
-                    SDL_CloseGamepad(pad);
-                    pad = nullptr;
+                if (SDL_Gamepad *g = SDL_GetGamepadFromID(e.gdevice.which)) {
+                    SDL_CloseGamepad(g);
+                    if (g == pad) {
+                        pad = another_pad();
+                        view.style = pad_style(pad);
+                    }
                 }
+                break;
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+                if (std::abs(e.gaxis.value) > 20000)
+                    switch_pad(e.gaxis.which);
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
                 view.pad = true;
+                switch_pad(e.gbutton.which);
                 int b = e.gbutton.button;
                 if (menu::is_open()) {
                     menu::Action a;
@@ -1455,7 +1556,7 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
             case SDL_EVENT_KEY_UP: {
                 bool down = e.type == SDL_EVENT_KEY_DOWN;
                 SDL_Scancode sc = e.key.scancode;
-                if (down)
+                if (down && sc != SDL_SCANCODE_AC_BACK)   // (Android's Back: a pad's button, or the system's)
                     view.pad = false;
                 if (menu::is_open()) {
                     if (!down)
@@ -1471,6 +1572,7 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
                     case SDL_SCANCODE_KP_ENTER:
                     case SDL_SCANCODE_SPACE: a = menu::Action::confirm; break;
                     case SDL_SCANCODE_ESCAPE:
+                    case SDL_SCANCODE_AC_BACK:
                     case SDL_SCANCODE_BACKSPACE: a = menu::Action::back; break;
                     case SDL_SCANCODE_TAB: a = shift ? menu::Action::prev_page : menu::Action::next_page; break;
                     default: continue;
@@ -1481,7 +1583,7 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
                     handle(menu::input(a, view));
                     break;
                 }
-                if (sc == SDL_SCANCODE_ESCAPE) {   // the menu (the game's own Esc is Quit to title)
+                if (sc == SDL_SCANCODE_ESCAPE || sc == SDL_SCANCODE_AC_BACK) {   // the menu (the game's own Esc is Quit to title)
                     if (down && !e.key.repeat)
                         open_menu();
                     break;
@@ -1604,8 +1706,8 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
                 apply_audio(set);
             if ((set.rumble_strength != applied.rumble_strength || set.rumble != applied.rumble) && set.rumble &&
                 pad)   // feel the new strength
-                SDL_RumbleGamepad(pad, Rumble::at_strength(0xD000, set.rumble_strength),
-                                  Rumble::at_strength(0x9000, set.rumble_strength), 200);
+                rumble_pad(pad, Rumble::at_strength(0xD000, set.rumble_strength),
+                           Rumble::at_strength(0x9000, set.rumble_strength), 200);
             applied = set;
         }
         if (!in_menu && set != written) {
@@ -1646,7 +1748,7 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
             uint16_t lo, hi;
             uint32_t hold;
             if (rumble.step(set.rumble && !in_menu, feel.shake(), set.rumble_strength, now, lo, hi, hold))
-                SDL_RumbleGamepad(pad, lo, hi, hold);
+                rumble_pad(pad, lo, hi, hold);
         }
         if (ran) {
             float buf[4096];
@@ -1803,20 +1905,7 @@ int run_window(bool force_fullscreen, const std::string &load_from, const std::v
     }
     if (set != written)
         settings::save(pref_dir() + "settings.ini", set);
-    // Leaving mid-level: keep the place for next time. Anywhere else (or
-    // without having answered the question at launch), leave things be.
-    if (!menu::asking_continue()) {
-        if (wide::playing()) {
-            quick_save(resume_path());
-            if (showing_wide)
-                write_thumb(resume_path(), wide_px.data(), pic_w, wide::kHeight);
-            else
-                write_thumb(resume_path(), present.data(), kViewW, kViewH);
-        } else {
-            std::remove(resume_path().c_str());
-            std::remove((resume_path() + ".thumb").c_str());
-        }
-    }
+    keep_place();
     SDL_Quit();
     record::finish();
     cpu_report();
@@ -1934,6 +2023,9 @@ int main(int argc, char **argv)
          setup::scan([](const std::string &p, std::string *err) { return disk::open(p.c_str(), err); }))
         disks.push_back(d);
     fullscreen = true;
+#endif
+#ifdef __ANDROID__
+    fullscreen = true;   // the whole screen, without Android's bars
 #endif
     if (headless) {
         std::string err = "no disk image (use --adf)";

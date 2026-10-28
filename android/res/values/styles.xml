@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Black from the first frame, with no title or system bars -->
+    <style name="AppTheme" parent="android:Theme.Black.NoTitleBar.Fullscreen" />
+</resources>

@@ -5,8 +5,8 @@
 [![Licence](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSE)
 
 A native version of the Amiga classic *James Pond 2: Codename RoboCod*
-(Millennium, 1991) for **Windows**, **macOS**, **Steam Deck and Linux**, and
-**PlayStation 5**. The game's 68000 code has been translated into C++, so it
+(Millennium, 1991) for **Windows**, **macOS**, **Steam Deck and Linux**,
+**Android** and **PlayStation 5**. The game's 68000 code has been translated into C++, so it
 runs as a program of its own instead of in an emulator, and it adds what the
 Amiga never had: true widescreen, smooth motion at your display's refresh
 rate, a pause menu with saves, a level select, a CRT filter, controller
@@ -23,7 +23,7 @@ rumble and more.
 - [What's new](#whats-new)
 - [Screenshots](#screenshots)
 - [What you need](#what-you-need)
-- [Install](#install): [Windows](#windows) · [macOS](#macos) · [Steam Deck](#steam-deck) · [Linux](#linux) · [PlayStation 5](#playstation-5)
+- [Install](#install): [Windows](#windows) · [macOS](#macos) · [Steam Deck](#steam-deck) · [Linux](#linux) · [Android](#android) · [PlayStation 5](#playstation-5)
 - [Controls](#controls)
 - [The menu](#the-menu)
 - [Saves and settings](#saves-and-settings)
@@ -75,6 +75,8 @@ rumble and more.
   These don't, yet: the **original Millennium** release, raw-track
   ("extended ADF") dumps of the copy-protected disk, `.dms` and `.ipf`
   images. The game tells you which you have; see [Help](#help).
+- For Android: a device with a controller, its own or one connected over
+  Bluetooth or USB.
 - For the PlayStation 5: a console that runs homebrew, with an FTP server and
   a way to register a title folder (ShadowMountPlus, for example).
 
@@ -129,6 +131,30 @@ Steam to **Gamepad**.
 As for the Steam Deck: unpack `JamesPond2-Linux-<version>.tar.gz` and run
 `./jp2` (or `./run.sh` for full screen). The program needs only the C
 library, so it runs on most 64-bit x86 distributions.
+
+### Android
+
+For Android handhelds (Retroid Pocket, AYN Odin, Anbernic and the like),
+Android TV boxes, and phones or tablets with a controller.
+
+1. Download `JamesPond2-Android-<version>.apk` from the
+   [releases](https://github.com/griches/JamesPond2RobocodRecomp/releases) and
+   open it on the device to install it. Android asks you to allow installing
+   apps from wherever you opened it (the browser or the file manager) the
+   first time. From a computer, `adb install JamesPond2-Android-<version>.apk`
+   does the same.
+2. Start **James Pond 2**. The first time, the game asks for your disk: choose
+   **Choose a disk image…** and pick it in Android's file picker. The disk is
+   copied into the game's own folder, so this happens only once.
+
+Without a file picker (some Android TV boxes), copy the disk over USB into
+`Android/data/mobi.bouncingball.jamespond2/files` on the device's storage
+(the folder is there after the first start), then choose **Look again**.
+
+Needs Android 7 or later on a 64-bit ARM device. The game is played with a
+controller, and Back does what Esc does: it opens the menu, and goes back in
+it. A handheld whose built-in controls have no rumble motor of their own
+buzzes with the device's vibration motor instead.
 
 ### PlayStation 5
 
@@ -200,13 +226,14 @@ Everything the game keeps is in one folder:
 | Windows | `%APPDATA%\bouncingball\James Pond 2\` |
 | macOS | `~/Library/Application Support/bouncingball/James Pond 2/` |
 | Steam Deck and Linux | `~/.local/share/bouncingball/James Pond 2/` |
+| Android | the game's own storage, which **Clear storage** in Android's settings for the app empties |
 | PlayStation 5 | `/data/homebrew/PPSA99323/userdata/bouncingball/James Pond 2/` |
 
 - `quicksave.jp2s`, `slot1.jp2s` … `slot3.jp2s`: your saves (the `.thumb`
   files beside them are their pictures);
 - `resume.jp2s`: where you were when you last quit in the middle of a level;
 - `settings.ini`: your menu settings;
-- `disk.adf`: the copy of your disk the game plays from (Windows, macOS, Linux).
+- `disk.adf`: the copy of your disk the game plays from (Windows, macOS, Linux, Android).
 
 Saves belong to your disk: a save made with one release of the game won't load
 with another.
@@ -225,7 +252,8 @@ with another.
 | *this isn't the Amiga (OCS) James Pond 2 disk* | The file is another game, or another machine's version |
 
 **I want to use a different disk.** Delete `disk.adf` from the saves folder
-(above) and start the game again; it asks for one.
+(above) and start the game again; it asks for one. On Android, **Clear
+storage** for the app does it, but takes your saves and settings with it.
 
 **Windows says it protected your PC.** That's SmartScreen, which warns about
 programs it hasn't seen often. Choose **More info**, then **Run anyway**.
@@ -244,6 +272,10 @@ a brighter sound.
 
 **Robocod can't go back left through some tubes.** That's the original game:
 some of the narrow sloping tubes only let him through in one direction.
+
+**Android: the controller does nothing.** Press any button on it: the game
+reads the controller used last, and Android counts some devices that aren't
+controllers (a TV box's remote, for one) as controllers too.
 
 **PlayStation 5: the title doesn't show on the home screen.** Run
 ShadowMountPlus's scan again, or restart the console with the folder in

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The home-screen art fills the icon; launchers show its middle, in their own shape.
+     tools/build.sh makes ic_launcher_art from the art in gamedata/. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@mipmap/ic_launcher_art" />
+    <foreground android:drawable="@android:color/transparent" />
+</adaptive-icon>

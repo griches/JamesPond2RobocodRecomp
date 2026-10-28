@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(JamesPond2Recomp VERSION 1.0.2 LANGUAGES C CXX)
+project(JamesPond2Recomp VERSION 1.0.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,15 +73,21 @@ set(JP2_RUNTIME
   runtime/ui.cpp
   runtime/wide.cpp)
 
-# The PlayStation 5 builds the game alone, from code another build recompiled
-# (JP2_GENERATED_DIR: the Mac's build/mac/generated).
-if(JP2_PS5)
+# The PlayStation 5 and Android build the game alone, from code another build
+# recompiled (JP2_GENERATED_DIR: the Mac's build/mac/generated).
+if(JP2_PS5 OR ANDROID)
   set(GEN ${JP2_GENERATED_DIR})
   file(GLOB GEN_CODE ${GEN}/code_*.cpp)
   add_library(jp2-code OBJECT ${GEN_CODE} ${GEN}/tables.cpp)
   target_include_directories(jp2-code PRIVATE runtime)
   target_compile_options(jp2-code PRIVATE -Wno-unused-label -Wno-unused-variable -Wno-parentheses-equality)
-  add_executable(jp2 ${JP2_RUNTIME} runtime/cpu_recomp.cpp runtime/recomp_exc.cpp $<TARGET_OBJECTS:jp2-code>)
+  set(JP2_GAME ${JP2_RUNTIME} runtime/cpu_recomp.cpp runtime/recomp_exc.cpp $<TARGET_OBJECTS:jp2-code>)
+  if(ANDROID)   # SDL's Java side loads the game as libmain.so
+    add_library(jp2 SHARED ${JP2_GAME})
+    set_target_properties(jp2 PROPERTIES OUTPUT_NAME main)
+  else()
+    add_executable(jp2 ${JP2_GAME})
+  endif()
   target_include_directories(jp2 PRIVATE runtime vendor/stb vendor/puff)
   target_link_libraries(jp2 PRIVATE musashi SDL3::SDL3)
   return()
